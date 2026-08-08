@@ -1340,8 +1340,13 @@ function Cmd-JStart {
                                     $hex = [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-','').ToLower()
                                 } finally { $fs.Dispose() }
                             } catch { }
-                            if (-not [string]::IsNullOrEmpty($hex)) { $out.WriteLine("H $hex $p") }
-                            $out.WriteLine("P $n $total $p"); $out.Flush()
+                            # Paths leave this helper in wire shape, always:
+                            # what the client gets back from a hash job is
+                            # fed straight into its own path handling, and a
+                            # "C:\dir\file" there is not a path it can use.
+                            $wp = Convert-WinToPosix $p
+                            if (-not [string]::IsNullOrEmpty($hex)) { $out.WriteLine("H $hex $wp") }
+                            $out.WriteLine("P $n $total $wp"); $out.Flush()
                         }
                         $out.WriteLine("T $n")
                     } finally { $out.Dispose() }
