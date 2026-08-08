@@ -496,7 +496,9 @@ function Cmd-Info {
         $wire = Read-PathLine
         if (Test-VirtualRoot $wire) {
             Emit-ModeLine
-            Write-Line ("{0:x} 0 0 0 0 0 0 /" -f $F4MODE_DIR -bor $F4PERM_DEF)
+            # The format operator binds tighter than -bor, so the mode has to
+            # be combined before it is formatted or the string gets ored.
+            Write-Line ("{0:x} 0 0 0 0 0 0 /" -f ($F4MODE_DIR -bor $F4PERM_DEF))
             Write-Ok
             return
         }
