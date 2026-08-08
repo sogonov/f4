@@ -341,6 +341,18 @@ func parseBanner(msg string) (Features, error) {
 // for the shell to report itself ready. A motd is long; it is not endless.
 const maxBootstrapLines = 1000
 
+// ReadyTimeout bounds how long the bootstrap may stay silent before the peer
+// is declared unable to run it. A shell that does not understand the
+// bootstrap does not answer at all: a PowerShell peer given the POSIX line
+// prints its parse error on stderr, which the transport discards, and then
+// waits for input forever. Without a bound the handshake would block there
+// for good, and a caller with a fallback flavor would never get the failure
+// it needs to try the other one.
+//
+// It bounds silence rather than the whole wait, so a long motd arriving one
+// slow line at a time still gets through.
+var ReadyTimeout = 20 * time.Second
+
 // waitForReady consumes whatever the login printed until the bootstrap says
 // it is running. Sending the helper before that is what the whole two step
 // upload exists to avoid.
@@ -351,7 +363,7 @@ func (s *Session) waitForReady(ctx context.Context) error {
 			s.broken = true
 			return err
 		}
-		line, err := s.readLine()
+		line, err := s.readLineWithin(ctx, ReadyTimeout)
 		if err != nil {
 			s.broken = true
 			return err
@@ -362,6 +374,37 @@ func (s *Session) waitForReady(ctx context.Context) error {
 	}
 	s.broken = true
 	return fmt.Errorf("fishplus: the remote shell never reported being ready")
+}
+
+// readLineWithin reads one line, giving up once the peer has been silent for
+// d or the context is done. The read itself cannot be interrupted — it is a
+// blocking read on a network stream — so it is left to finish in a goroutine
+// on the line it owns; the session is on its way out either way, since every
+// caller of this treats a failure here as fatal to the session.
+//
+// The timeout message is the one isHandshakeFailure already recognizes, so a
+// peer that stays silent reads as "this flavor is wrong" rather than as a
+// broken network.
+func (s *Session) readLineWithin(ctx context.Context, d time.Duration) (string, error) {
+	type result struct {
+		line string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		line, err := s.readLine()
+		ch <- result{line, err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.line, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-timer.C:
+		return "", fmt.Errorf("fishplus: the remote shell never reported being ready within %s", d)
+	}
 }
 
 // Exec runs a command that takes only short tokens as arguments. A token
