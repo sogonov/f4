@@ -1066,15 +1066,33 @@ function Cmd-LineIdx {
                                      [System.IO.FileAccess]::Read,
                                      [System.IO.FileShare]::ReadWrite)
         try {
-            $sr = New-Object System.IO.StreamReader($fs, $utf8NoBom, $false, 65536, $true)
+            # Byte-level walk for the same reason as grep: a StreamReader
+            # eats the terminator without saying how many bytes it was, so a
+            # CRLF file came out one byte short per line. awk on the POSIX
+            # side counts the CR as part of the line, and so does this.
+            $buf = New-Object 'byte[]' 65536
             $lineNo = 0L
-            $offset = 0L
-            while (($line = $sr.ReadLine()) -ne $null) {
+            $lineStart = 0L
+            $pos = 0L
+            while ($true) {
+                $got = $fs.Read($buf, 0, $buf.Length)
+                if ($got -le 0) { break }
+                for ($i = 0; $i -lt $got; $i++) {
+                    if ($buf[$i] -ne 0x0A) { continue }
+                    $lineNo++
+                    if ($lineNo -ge $first -and $lineNo -lt ($first + $count)) {
+                        Write-Line ([string]$lineStart)
+                    }
+                    $lineStart = $pos + $i + 1
+                }
+                $pos += $got
+            }
+            # A trailing line with no LF of its own is still a line.
+            if ($lineStart -lt $pos) {
                 $lineNo++
                 if ($lineNo -ge $first -and $lineNo -lt ($first + $count)) {
-                    Write-Line ([string]$offset)
+                    Write-Line ([string]$lineStart)
                 }
-                $offset += $utf8NoBom.GetByteCount($line) + 1
             }
             Write-Line ("T " + $lineNo)
         } finally { $fs.Dispose() }
