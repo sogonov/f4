@@ -398,16 +398,21 @@ func sshFishDialer(host, port, user, pass string, timeout int) FishDialer {
 	})
 }
 
-// sshFishDialerPwsh is the fallback for a peer whose login shell is
-// PowerShell. sshd on Windows resolves sess.Shell() to the DefaultShell
-// (powershell.exe by default), so no command is passed; a request that
-// carried one would be handed to PowerShell as its -Command argument and
-// would parse "exec /bin/sh" as an unknown cmdlet. No pseudo-terminal is
-// requested for the same reason as the POSIX side: a ConPTY would echo
-// every request back and inject its own control sequences.
+// sshFishDialerPwsh is the fallback for a Windows peer. It asks sshd to
+// run "powershell.exe -NoLogo -NoProfile" rather than sess.Shell(): the
+// exec request resolves through the DefaultShell of the peer, which is
+// cmd.exe on a stock OpenSSH-Server-Windows install, so a bare shell
+// request would land the helper in cmd — which does not understand a
+// single line of PowerShell. Routing through
+// "cmd.exe /c powershell.exe -NoLogo -NoProfile" instead lets cmd fork
+// PowerShell for us; a peer whose DefaultShell is already powershell.exe
+// or pwsh pays for a nested launch (~200 ms) but the same helper runs
+// on both. No pseudo-terminal is requested for the same reason as the
+// POSIX side: a ConPTY would echo every request back and inject VT
+// sequences.
 func sshFishDialerPwsh(host, port, user, pass string, timeout int) FishDialer {
 	return sshFishDialerWith(host, port, user, pass, timeout, func(s *ssh.Session) error {
-		return s.Shell()
+		return s.Start("powershell.exe -NoLogo -NoProfile")
 	})
 }
 
