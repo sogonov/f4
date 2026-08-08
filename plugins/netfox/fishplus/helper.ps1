@@ -1489,7 +1489,10 @@ function Invoke-JCleanup {
 # The features string mirrors what helper.sh advertises, with fake
 # tokens for tools the client uses to gate features. Real work happens
 # in .NET. See WINDOWS_PORT.md for the rationale of each tag.
-$F4FEATS = 'flavor:pwsh base64 grep sed awk wc head tail truncate touch date sha256sum findbin jobs cp dd readlink du chown mode:stat read:filestream write:b64 headc headsafe tailc ddnotrunc statl ddbytes awkflush'
+# "hash:<tool>" is what gates the duplicate search on the client side
+# (Features.HashTool, checked by CanHash); announcing sha256sum alone is
+# not enough, exactly as in helper.sh where the two are separate tags.
+$F4FEATS = 'flavor:pwsh base64 grep sed awk wc head tail truncate touch date sha256sum findbin jobs cp dd readlink du chown mode:stat hash:sha256sum read:filestream write:b64 headc headsafe tailc ddnotrunc statl ddbytes awkflush'
 
 try {
     # A leading LF ensures the terminator starts a line even if the
