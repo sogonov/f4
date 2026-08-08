@@ -1,10 +1,14 @@
 # FISH+ Windows helper — manual test report
 
 Result of running `WINDOWS_TEST_PLAN.md` against a real Windows host.
-Seven defects were found and fixed; the wire is now clean for every
+Eight defects were found and fixed; the wire is now clean for every
 command the client can send. One item of the plan could not be run as
-written and one gap outside `helper.ps1` was found — both are spelled out
-below rather than glossed over.
+written, and the ssh lane is still blocked on one manual step — both are
+spelled out below rather than glossed over.
+
+Defects 1–7 are from the first pass over the draft. Defect 8 is from a
+second pass on top of the owner's `6e8806b`/`6c60b09`, which landed while
+this was being written; see *Follow-up round*.
 
 ## Environment
 
@@ -17,7 +21,7 @@ below rather than glossed over.
 | `Start-ThreadJob` under PS 5.1 | **absent** — the `Start-Job` fallback is what ran |
 | `Start-ThreadJob` under PS 7 | present (`Microsoft.PowerShell.ThreadJob`) |
 | Console input code page | cp866 (matters — see defect 1) |
-| OpenSSH Server | installed and running; `DefaultShell` **not** set (see §2.1) |
+| OpenSSH Server | installed and running; `DefaultShell` set to `powershell.exe`; key not yet authorized (see *Known-still-broken*) |
 
 Everything below was run under **both** shells. Both are green, so both
 the `Start-Job` and the `Start-ThreadJob` job backends are covered.
@@ -33,6 +37,7 @@ the `Start-Job` and the `Start-ThreadJob` job backends are covered.
 | 5 | `lidx` offsets were short by one byte per line on CRLF files | `9eb8afd` |
 | 6 | the hash job emitted Windows paths the client cannot use | `f6d64fc` |
 | 7 | polling a running job failed with a sharing violation | `c23e4a1` |
+| 8 | the flavor fallback could not fire — the first handshake hung instead of failing | `1087a30` |
 
 `go test -count=1 ./plugins/netfox/fishplus/...` passes after every one of
 them, and passed before the first — the existing suite never exercised
@@ -102,9 +107,9 @@ an ssh shell session has — and hands it `Base64BootstrapLinePwsh`, then
 runs the real `fishplus.Client` against it. 82 checks, all passing under
 both shells. It lives outside the repository; see *Suggested next steps*.
 
-**What this lane does not cover: a real ssh channel.** `DefaultShell`
-still points at `cmd.exe` on this host, and setting it (an `HKLM` write)
-plus authorizing a key was refused by the sandbox. The local pipe
+**What this lane does not cover: a real ssh channel.** `DefaultShell` has
+since been set to `powershell.exe`, but authorizing a key is still
+outstanding (see *Known-still-broken*). The local pipe
 reproduces the console host's stdin behaviour exactly — that is where
 defect 1 was found and fixed — but it does not prove out sshd's own
 plumbing. See *Known-still-broken* for why an ssh run would fail today for
@@ -271,25 +276,52 @@ final `ping` with a Cyrillic path round-tripped exactly.
   account does not have by default. `rdlink` was only checked for its
   refusal on a plain file.
 
+## Follow-up round: the flavor fallback
+
+`6e8806b` (netfox: fall back to a PowerShell shell request when POSIX
+fails) closes the transport gap this report originally listed as
+still-broken, and `6c60b09` adds the pwsh-gated test. Retested on top of
+both; `helper.ps1` needed no further changes.
+
+**Defect 8 — the fallback could not fire, because the first attempt never
+failed: it hung.** `establishWithFallback` switches flavors only when the
+primary handshake returns an error. A PowerShell peer handed the POSIX
+bootstrap prints its parse error on **stderr** — which the ssh transport
+sends to `io.Discard` — and then waits for input forever. On stdout it
+produces two prompt lines and nothing more, so `waitForReady` blocked on a
+read that would never return.
+
+Measured against a local `powershell.exe`: with a 15 s context deadline the
+handshake was **still blocked after 20 s**. The deadline is only checked
+between lines, and no further line arrives — so the ctx never rescues it.
+`waitForReady` now bounds the silence between lines (`ReadyTimeout`, 20 s),
+which makes the POSIX attempt end with *"the remote shell never reported
+being ready within 20s"* — a message `isHandshakeFailure` already matches,
+so the fallback promotes the PowerShell bootstrap as intended. Fixed in
+`1087a30`; bounding silence rather than the total wait keeps a slow motd
+working.
+
+Note on the new test: `TestHelperAgainstLocalPwsh` skips on Windows because
+the ~4 KiB console pipe deadlocks the write-then-read handshake. That is
+avoidable — the probe spools its writes into a goroutine, about fifteen
+lines — which would let the test cover the one platform whose ConsoleHost
+quirks it is really about. Left alone as the owner's call.
+
 ## Known-still-broken
 
-**The client cannot open a Windows peer over ssh at all — and this is not
-a `helper.ps1` problem.** `fish_vfs.go:319` starts every session with
-`sess.Start("exec /bin/sh")`. With `DefaultShell` set to `powershell.exe`,
-sshd hands that string to PowerShell, which has no idea what it means. The
-helper is ready; the transport still speaks only POSIX. Whatever flavor
-detection lands (`WINDOWS_PORT.md` recommends retry-on-fail) has to choose
-the start command too, not just the bootstrap. I did not touch this: it is
-transport design, not a defect in the draft under test.
+**The ssh lane still has not run.** `DefaultShell` is now set to
+`powershell.exe`, but key authentication is not in place: this account is
+in the administrators group, so sshd reads
+`__PROGRAMDATA__/ssh/administrators_authorized_keys` (per the `Match Group
+administrators` block in `sshd_config`), and that file does not exist —
+`ssh -o BatchMode=yes localhost` answers *Permission denied
+(publickey,password,keyboard-interactive)*. Creating it is the one step
+still outstanding.
 
-**The ssh lane was never exercised.** `DefaultShell` is still `cmd.exe`
-here and the sandbox refused both the `HKLM` write and the
-`administrators_authorized_keys` edit. To run it:
+The remaining step (the sandbox refuses this edit, so it has to be run by
+hand):
 
 ```powershell
-New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
-    -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-    -PropertyType String -Force
 $pub = Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
 Add-Content 'C:\ProgramData\ssh\administrators_authorized_keys' $pub
 icacls 'C:\ProgramData\ssh\administrators_authorized_keys' /inheritance:r `
@@ -333,20 +365,20 @@ feature list all held up under test and were not touched.
 
 ## Suggested next steps
 
-1. **Turn the probe into something that lives in the tree.** Either
-   `cmd/fishplus-probe`, or better, the `pwsh`-gated Go test
-   `WINDOWS_PORT.md` already plans (`TestHelperAgainstLocalPwsh`, same
-   shape as `TestHelperAgainstLocalShell`). Every defect above would have
-   been caught by it, and defects 1, 4, 5 and 7 are the kind that come
-   back. It has to send a request *after* a pause — sending everything up
-   front hides defect 1 completely.
-2. **Decide the start command for a Windows peer** before flavor
-   detection is written; `exec /bin/sh` is the blocker, not the bootstrap.
-3. **Run the ssh lane** once `DefaultShell` is set, specifically looking
-   for a ConPTY.
-4. **Consider compressing the helper.** At 38 KiB compacted the bootstrap
+1. **Let the pwsh-gated test run on Windows.** `6c60b09` already covers
+   the handshake, the pause and enum/read; it skips on Windows only
+   because of the pipe deadlock, which a spooled writer removes in about
+   fifteen lines. Windows is the platform whose ConsoleHost quirks
+   produced defects 1 and 8, so it is the one worth covering. The probe
+   also carries checks the test does not: grep/lidx offsets against a
+   CRLF file, scan/hash totals, the mutations, and the error paths —
+   defects 4–7 live there.
+2. **Run the ssh lane** once the key is authorized, specifically looking
+   for a ConPTY and for what sshd passes to PowerShell on an `exec`
+   request.
+3. **Consider compressing the helper.** At 38 KiB compacted the bootstrap
    line is 50 KiB, which is over the 32 KiB Windows command-line limit —
    so a transport that ever wants to pass it as an argument rather than on
    stdin cannot. gzip+base64 would bring it to roughly 10 KiB.
-5. **Re-check `Test-SafeTarget` against a UNC path.** It accepts
+4. **Re-check `Test-SafeTarget` against a UNC path.** It accepts
    `\\server\share`, but nothing in this lane exercised one.
