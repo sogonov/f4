@@ -334,6 +334,19 @@ func isHandshakeFailure(err error) bool {
 	if err == nil {
 		return false
 	}
+	// The far side hung up while the bootstrap was being uploaded or
+	// waited for. That is what a Windows peer does with the POSIX attempt:
+	// sshd resolves the exec request to powershell.exe -c "exec /bin/sh",
+	// PowerShell fails to parse it, prints to stderr — which the dialer
+	// discards — and exits, closing the channel. Measured against a real
+	// sshd this arrives as EOF within half a second, and it is the most
+	// direct evidence there is that this flavor is the wrong one.
+	//
+	// The dial already succeeded by the time this runs, so an EOF here is
+	// a shell that would not stay, not a network that will not carry.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
 	msg := err.Error()
 	// The two phrases parseBanner / HandshakeWithOptions build for
 	// "answered but wrong": one for the banner shape, one for the version.
