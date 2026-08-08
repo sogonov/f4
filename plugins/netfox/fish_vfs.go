@@ -72,8 +72,17 @@ type FishDialer func(ctx context.Context) (io.Writer, io.Reader, io.Closer, erro
 type fishConn struct {
 	client *fishplus.Client
 	ka     *fishplus.Keepalive
-	dial   FishDialer
-	closer io.Closer
+	// dial and opts describe how to bring the primary shell flavor up. A
+	// site the first attempt cannot reach — a Windows peer whose sshd
+	// answers "exec /bin/sh" with a PowerShell parse error — is served by
+	// dialAlt/optsAlt instead. Once a fallback succeeds it becomes the
+	// primary, so every reconnect after the first goes straight to the
+	// flavor that actually works.
+	dial    FishDialer
+	opts    fishplus.HandshakeOptions
+	dialAlt FishDialer
+	optsAlt fishplus.HandshakeOptions
+	closer  io.Closer
 
 	mu     sync.Mutex
 	refs   int
@@ -112,7 +121,8 @@ func (c *fishConn) reconnect(ctx context.Context, dead *fishplus.Client) (*fishp
 		c.mu.Unlock()
 		return fresh, nil
 	}
-	dial := c.dial
+	dial, opts := c.dial, c.opts
+	dialAlt, optsAlt := c.dialAlt, c.optsAlt
 	c.mu.Unlock()
 
 	if dial == nil {
@@ -122,13 +132,8 @@ func (c *fishConn) reconnect(ctx context.Context, dead *fishplus.Client) (*fishp
 	// Dialling and the handshake happen outside the lock: both take as long as
 	// the network takes, and holding the lock would stall every other view of
 	// this connection for that whole time.
-	stdin, stdout, closer, err := dial(ctx)
+	sess, usedAlt, closer, err := establishWithFallback(ctx, dial, opts, dialAlt, optsAlt)
 	if err != nil {
-		return nil, err
-	}
-	sess := fishplus.NewSession(stdin, stdout, closer)
-	if err := sess.Handshake(ctx); err != nil {
-		sess.Close()
 		return nil, err
 	}
 	client := fishplus.NewClient(sess)
@@ -157,6 +162,12 @@ func (c *fishConn) reconnect(ctx context.Context, dead *fishplus.Client) (*fishp
 	c.client = client
 	c.ka = fishplus.StartKeepalive(client, fishplus.DefaultKeepaliveInterval)
 	c.closer = closer
+	if usedAlt {
+		// The fallback answered where the primary did not. Promote it so
+		// every reconnect after this one goes straight to what works, and
+		// the primary is only tried again if the new primary also fails.
+		c.dial, c.opts, c.dialAlt, c.optsAlt = c.dialAlt, c.optsAlt, c.dial, c.opts
+	}
 	c.mu.Unlock()
 
 	oldKA.Stop()
@@ -208,14 +219,28 @@ func NewFishVFSOnStreamWithOptions(ctx context.Context, parent vfs.VFS, stdin io
 // that a site that cannot be reached fails at open time rather than at the
 // first request.
 func NewFishVFSOnDialer(ctx context.Context, parent vfs.VFS, dial FishDialer, title string) (*FishVFS, error) {
+	return NewFishVFSOnDialers(ctx, parent, dial, fishplus.HandshakeOptions{}, nil, fishplus.HandshakeOptions{}, title)
+}
+
+// NewFishVFSOnDialers is NewFishVFSOnDialer with a fallback: a peer the
+// first (dial, opts) pair cannot bring a helper up on is retried with the
+// second pair. Meant for sites where the shell flavor is not known at
+// open time — a POSIX login shell wins the common case, and a PowerShell
+// peer answers only after the retry. Once the fallback succeeds it is
+// promoted to primary, so every reconnect after the first goes straight
+// to the flavor that actually works. A nil dialAlt means no fallback.
+func NewFishVFSOnDialers(ctx context.Context, parent vfs.VFS, dial FishDialer, opts fishplus.HandshakeOptions, dialAlt FishDialer, optsAlt fishplus.HandshakeOptions, title string) (*FishVFS, error) {
 	if dial == nil {
 		return nil, ErrNoDialer
 	}
-	stdin, stdout, closer, err := dial(ctx)
+	sess, usedAlt, closer, err := establishWithFallback(ctx, dial, opts, dialAlt, optsAlt)
 	if err != nil {
 		return nil, err
 	}
-	return newFishVFSOnStream(ctx, parent, stdin, stdout, closer, title, dial, fishplus.HandshakeOptions{})
+	if usedAlt {
+		dial, opts, dialAlt, optsAlt = dialAlt, optsAlt, dial, opts
+	}
+	return newFishVFSFromSession(parent, sess, closer, title, dial, opts, dialAlt, optsAlt), nil
 }
 
 func newFishVFSOnStream(ctx context.Context, parent vfs.VFS, stdin io.Writer, stdout io.Reader, closer io.Closer, title string, dial FishDialer, opts fishplus.HandshakeOptions) (*FishVFS, error) {
@@ -224,23 +249,98 @@ func newFishVFSOnStream(ctx context.Context, parent vfs.VFS, stdin io.Writer, st
 		sess.Close()
 		return nil, err
 	}
+	return newFishVFSFromSession(parent, sess, closer, title, dial, opts, nil, fishplus.HandshakeOptions{}), nil
+}
+
+// newFishVFSFromSession wraps an already-handshaked session in a FishVFS,
+// used by every construction path so the wrapper stays in one place.
+func newFishVFSFromSession(parent vfs.VFS, sess *fishplus.Session, closer io.Closer, title string, dial FishDialer, opts fishplus.HandshakeOptions, dialAlt FishDialer, optsAlt fishplus.HandshakeOptions) *FishVFS {
 	client := fishplus.NewClient(sess)
-	cwd, err := client.Pwd(ctx)
+	cwd, err := client.Pwd(context.Background())
 	if err != nil || !path.IsAbs(cwd) {
 		cwd = "/"
 	}
 	return &FishVFS{
 		parent: parent,
 		conn: &fishConn{
-			client: client,
-			refs:   1,
-			ka:     fishplus.StartKeepalive(client, fishplus.DefaultKeepaliveInterval),
-			dial:   dial,
-			closer: closer,
+			client:  client,
+			refs:    1,
+			ka:      fishplus.StartKeepalive(client, fishplus.DefaultKeepaliveInterval),
+			dial:    dial,
+			opts:    opts,
+			dialAlt: dialAlt,
+			optsAlt: optsAlt,
+			closer:  closer,
 		},
 		path:  cwd,
 		title: title,
-	}, nil
+	}
+}
+
+// establishSession dials, brings up the helper with the given handshake
+// options, and returns a session that is ready to serve requests. The
+// closer returned is the one the dialer supplied; it is closed with the
+// session on failure and stored on fishConn on success.
+func establishSession(ctx context.Context, dial FishDialer, opts fishplus.HandshakeOptions) (*fishplus.Session, io.Closer, error) {
+	stdin, stdout, closer, err := dial(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	sess := fishplus.NewSession(stdin, stdout, closer)
+	if err := sess.HandshakeWithOptions(ctx, opts); err != nil {
+		sess.Close()
+		return nil, nil, err
+	}
+	return sess, closer, nil
+}
+
+// establishWithFallback tries the primary (dial, opts) pair first and
+// falls back to (dialAlt, optsAlt) only when the primary handshake fails
+// — that is, after the transport already answered. A dial-level failure
+// is returned as-is: the network cannot be worked around by trying a
+// different shell. A nil dialAlt disables the fallback, which is what
+// callers with a known-good flavor pass. The bool report tells the caller
+// which pair produced the session so it can promote the fallback for
+// future reconnects.
+func establishWithFallback(ctx context.Context, dial FishDialer, opts fishplus.HandshakeOptions, dialAlt FishDialer, optsAlt fishplus.HandshakeOptions) (*fishplus.Session, bool, io.Closer, error) {
+	sess, closer, err := establishSession(ctx, dial, opts)
+	if err == nil {
+		return sess, false, closer, nil
+	}
+	// A dial failure — no route, refused, auth — has no shell flavor to
+	// try. Only a handshake failure means the transport is fine but the
+	// far side did not recognize the bootstrap; only then is the fallback
+	// worth trying.
+	if _, isRemoteErr := err.(*fishplus.RemoteError); !isRemoteErr && !isHandshakeFailure(err) {
+		return nil, false, nil, err
+	}
+	if dialAlt == nil {
+		return nil, false, nil, err
+	}
+	sessAlt, closerAlt, errAlt := establishSession(ctx, dialAlt, optsAlt)
+	if errAlt != nil {
+		// The original error is more informative — the alt was a guess,
+		// the primary is what the caller configured.
+		return nil, false, nil, err
+	}
+	return sessAlt, true, closerAlt, nil
+}
+
+// isHandshakeFailure recognizes the errors HandshakeWithOptions raises
+// when the far side answered but did not speak the expected protocol.
+// A read that failed because the transport is broken should not trigger
+// a shell-flavor retry, since neither flavor would fare any better.
+func isHandshakeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// The two phrases parseBanner / HandshakeWithOptions build for
+	// "answered but wrong": one for the banner shape, one for the version.
+	return strings.Contains(msg, "unexpected banner") ||
+		strings.Contains(msg, "remote speaks protocol") ||
+		strings.Contains(msg, "never reported being ready") ||
+		strings.Contains(msg, "bad terminator")
 }
 
 // sshShell ties the lifetime of the remote shell and of the connection that
@@ -280,6 +380,29 @@ func (s *sshShell) OpenPty(cols, rows int) (any, error) {
 // account's login shell may well be csh, fish or something else that does not
 // speak the POSIX syntax the helper is written in.
 func sshFishDialer(host, port, user, pass string, timeout int) FishDialer {
+	return sshFishDialerWith(host, port, user, pass, timeout, func(s *ssh.Session) error {
+		return s.Start("exec /bin/sh")
+	})
+}
+
+// sshFishDialerPwsh is the fallback for a peer whose login shell is
+// PowerShell. sshd on Windows resolves sess.Shell() to the DefaultShell
+// (powershell.exe by default), so no command is passed; a request that
+// carried one would be handed to PowerShell as its -Command argument and
+// would parse "exec /bin/sh" as an unknown cmdlet. No pseudo-terminal is
+// requested for the same reason as the POSIX side: a ConPTY would echo
+// every request back and inject its own control sequences.
+func sshFishDialerPwsh(host, port, user, pass string, timeout int) FishDialer {
+	return sshFishDialerWith(host, port, user, pass, timeout, func(s *ssh.Session) error {
+		return s.Shell()
+	})
+}
+
+// sshFishDialerWith is what both flavors share. The only thing they
+// disagree about is how they ask sshd to give them the shell: exec+cmd
+// on POSIX (which bypasses an exotic login shell), plain shell on
+// Windows (which respects DefaultShell).
+func sshFishDialerWith(host, port, user, pass string, timeout int, startShell func(*ssh.Session) error) FishDialer {
 	return func(ctx context.Context) (io.Writer, io.Reader, io.Closer, error) {
 		// DialSSH carries a timeout of its own and cannot be interrupted, so
 		// the context is honoured where it can be: before the dial, and again
@@ -316,7 +439,7 @@ func sshFishDialer(host, port, user, pass string, timeout int) FishDialer {
 			return nil, nil, nil, err
 		}
 		sess.Stderr = io.Discard
-		if err := sess.Start("exec /bin/sh"); err != nil {
+		if err := startShell(sess); err != nil {
 			shell.Close()
 			return nil, nil, nil, err
 		}
@@ -340,7 +463,17 @@ func NewFishVFS(parent vfs.VFS, host, port, user, pass string, timeout int) (*Fi
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sshTimeout(timeout))
 	defer cancel()
-	v, err := NewFishVFSOnDialer(ctx, parent, sshFishDialer(host, port, user, pass, timeout), title)
+	// The primary flavor is POSIX (exec /bin/sh + line bootstrap): the
+	// bulk of hosts a panel opens are Linux or a BSD, and the client's
+	// existing tests exercise that path in every commit. A Windows peer
+	// with sshd's DefaultShell set to powershell.exe answers the POSIX
+	// bootstrap with a parse error; the fallback dialer catches that,
+	// asks sshd for a plain shell (which resolves to PowerShell on
+	// Windows), and delivers the base64-encoded helper.ps1 through it.
+	v, err := NewFishVFSOnDialers(ctx, parent,
+		sshFishDialer(host, port, user, pass, timeout), fishplus.HandshakeOptions{},
+		sshFishDialerPwsh(host, port, user, pass, timeout), fishplus.HandshakeOptions{Bootstrap: fishplus.BootstrapBase64LinePwsh},
+		title)
 	if err != nil {
 		return nil, err
 	}
