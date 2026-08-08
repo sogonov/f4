@@ -99,6 +99,12 @@ const (
 	// BootstrapBase64Line sends one printable-ASCII line containing the
 	// complete base64-encoded helper. It avoids per-line shell read overhead.
 	BootstrapBase64Line
+	// BootstrapBase64LinePwsh is the PowerShell counterpart of
+	// BootstrapBase64Line: it fits the compacted helper.ps1 into one
+	// printable-ASCII line and drives a PowerShell peer through the same
+	// wire protocol. Selected explicitly by callers today; flavor auto-probe
+	// will pick it based on the peer's response to a probe line.
+	BootstrapBase64LinePwsh
 )
 
 // HandshakeOptions controls helper upload. Callers that do not need a
@@ -271,6 +277,14 @@ func (s *Session) HandshakeWithOptions(ctx context.Context, opts HandshakeOption
 		}
 	case BootstrapBase64Line:
 		if _, err := io.WriteString(s.w, Base64BootstrapLine(s.token)); err != nil {
+			s.broken = true
+			return err
+		}
+		if err := s.waitForReady(ctx); err != nil {
+			return err
+		}
+	case BootstrapBase64LinePwsh:
+		if _, err := io.WriteString(s.w, Base64BootstrapLinePwsh(s.token)); err != nil {
 			s.broken = true
 			return err
 		}

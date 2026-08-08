@@ -18,9 +18,17 @@ const tokenPlaceholder = "__F4_TOKEN__"
 //go:embed helper.sh
 var helperSource string
 
+//go:embed helper.ps1
+var helperSourcePwsh string
+
 // HelperSource returns the unmodified helper script. Useful for tests and
 // for dumping the script when debugging a remote host.
 func HelperSource() string { return helperSource }
+
+// HelperSourcePwsh returns the unmodified PowerShell helper. Windows peers
+// speak the same wire protocol as POSIX ones; the flavor detection picks
+// which script is delivered.
+func HelperSourcePwsh() string { return helperSourcePwsh }
 
 // Compact strips comments and blank lines from a shell script and removes
 // leading indentation. The helper is sent over the wire on every connect,
@@ -128,4 +136,40 @@ func splitReadyMarker(s, token string) string {
 // substituted, ready to be written into the remote shell's stdin.
 func HelperScript(token string) string {
 	return Compact(strings.ReplaceAll(helperSource, tokenPlaceholder, token))
+}
+
+// HelperScriptPwsh returns the compacted PowerShell helper script with the
+// session token substituted. Compaction rules match the POSIX helper: strip
+// CRs, comment lines and blank lines, keep everything else. The PowerShell
+// helper is written without here-strings or backtick continuations so this
+// simple stripping never breaks a statement.
+func HelperScriptPwsh(token string) string {
+	return Compact(strings.ReplaceAll(helperSourcePwsh, tokenPlaceholder, token))
+}
+
+// Base64BootstrapLinePwsh is the PowerShell analogue of Base64BootstrapLine.
+// It fits the compacted helper into one printable-ASCII line that the remote
+// PowerShell decodes with .NET and hands to Invoke-Expression. No temporary
+// file, no assumption about locale, no dependency on PSReadLine.
+//
+// The readiness marker is printed before Invoke-Expression so waitForReady
+// consumes the login banner and any prompt output first. Splitting the
+// marker into two adjacent literals keeps a terminal echo of this very
+// command from looking like the marker itself, mirroring the POSIX version.
+func Base64BootstrapLinePwsh(token string) string {
+	prefix := "# F4B64" + token
+	payload := prefix + "\n" + HelperScriptPwsh(token)
+	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
+	// Same reason as the POSIX version: the encoded blob must not contain the
+	// marker as one contiguous run of bytes.
+	encoded = splitReadyMarker(encoded, token)
+	return "$F4B='" + encoded + "'; " +
+		"Write-Output ('F4R'+'DY'+'" + token + "'); " +
+		"try { " +
+		"$F4S=[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($F4B)); " +
+		"Remove-Variable F4B -Force -ErrorAction SilentlyContinue; " +
+		"Invoke-Expression $F4S " +
+		"} catch { " +
+		"Write-Output ('.' + '" + token + "' + ' 0 err bootstrap ' + $_.Exception.Message.Replace([char]10,' ').Replace([char]13,' ')) " +
+		"}\n"
 }
