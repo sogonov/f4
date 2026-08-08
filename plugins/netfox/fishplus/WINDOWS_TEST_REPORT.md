@@ -1,14 +1,14 @@
 # FISH+ Windows helper — manual test report
 
 Result of running `WINDOWS_TEST_PLAN.md` against a real Windows host.
-Eight defects were found and fixed; the wire is now clean for every
-command the client can send. One item of the plan could not be run as
-written, and the ssh lane is still blocked on one manual step — both are
-spelled out below rather than glossed over.
+Nine defects were found and fixed. Every section of the plan passes, over
+a local pipe and over a real ssh channel; the one item that could not be
+run as written is spelled out below rather than glossed over.
 
-Defects 1–7 are from the first pass over the draft. Defect 8 is from a
-second pass on top of the owner's `6e8806b`/`6c60b09`, which landed while
-this was being written; see *Follow-up round*.
+Defects 1–7 are from the first pass over the draft. Defects 8 and 9 are
+from a second pass on top of the owner's `6e8806b`/`6c60b09`, which landed
+while this was being written: both are in the flavor fallback, and both
+kept it from ever firing. See *Follow-up round* and *§ 4*.
 
 ## Environment
 
@@ -21,7 +21,7 @@ this was being written; see *Follow-up round*.
 | `Start-ThreadJob` under PS 5.1 | **absent** — the `Start-Job` fallback is what ran |
 | `Start-ThreadJob` under PS 7 | present (`Microsoft.PowerShell.ThreadJob`) |
 | Console input code page | cp866 (matters — see defect 1) |
-| OpenSSH Server | installed and running; `DefaultShell` set to `powershell.exe`; key not yet authorized (see *Known-still-broken*) |
+| OpenSSH Server | installed and running, `DefaultShell` = `powershell.exe`, key authentication working |
 
 Everything below was run under **both** shells. Both are green, so both
 the `Start-Job` and the `Start-ThreadJob` job backends are covered.
@@ -38,6 +38,7 @@ the `Start-Job` and the `Start-ThreadJob` job backends are covered.
 | 6 | the hash job emitted Windows paths the client cannot use | `f6d64fc` |
 | 7 | polling a running job failed with a sharing violation | `c23e4a1` |
 | 8 | the flavor fallback could not fire — the first handshake hung instead of failing | `1087a30` |
+| 9 | ...and on a real peer it failed with EOF, which the fallback did not count as a wrong flavor | `67abcce` |
 
 `go test -count=1 ./plugins/netfox/fishplus/...` passes after every one of
 them, and passed before the first — the existing suite never exercised
@@ -107,13 +108,8 @@ an ssh shell session has — and hands it `Base64BootstrapLinePwsh`, then
 runs the real `fishplus.Client` against it. 82 checks, all passing under
 both shells. It lives outside the repository; see *Suggested next steps*.
 
-**What this lane does not cover: a real ssh channel.** `DefaultShell` has
-since been set to `powershell.exe`, but authorizing a key is still
-outstanding (see *Known-still-broken*). The local pipe
-reproduces the console host's stdin behaviour exactly — that is where
-defect 1 was found and fixed — but it does not prove out sshd's own
-plumbing. See *Known-still-broken* for why an ssh run would fail today for
-a reason that has nothing to do with `helper.ps1`.
+This lane does not cover sshd's own plumbing; § 4 does, and the same 82
+checks pass there too.
 
 ### 2.1 Handshake — PASS
 
@@ -272,9 +268,6 @@ final `ping` with a Cyrillic path round-tripped exactly.
   as a remote error; the session stays usable.
 - `chmod 0444` sets the ReadOnly attribute, `chmod 0644` clears it —
   the projection the design describes, verified through `os.Stat`.
-- Symlinks were **not** tested: creating one needs a privilege this
-  account does not have by default. `rdlink` was only checked for its
-  refusal on a plain file.
 
 ## Follow-up round: the flavor fallback
 
@@ -307,38 +300,59 @@ avoidable — the probe spools its writes into a goroutine, about fifteen
 lines — which would let the test cover the one platform whose ConsoleHost
 quirks it is really about. Left alone as the owner's call.
 
+## § 4 The ssh lane — PASS
+
+Ran once the key was authorized. The probe grew an `-ssh` mode that opens
+the channel exactly the way `sshFishDialerPwsh` does: shell request (no
+command, so sshd resolves `DefaultShell`), no pseudo-terminal, stderr
+discarded, and **no spooling** of writes.
+
+**The whole plan passes over a real channel: 82 checks, zero failures.**
+`pwd` answers `/c/Users/sogonov` — sshd starts the shell in the home
+directory, and the wire path is POSIX-shaped as it should be.
+
+Three questions this lane answered that the local pipe could not:
+
+- **No ConPTY.** For a shell request without a pty, sshd gives PowerShell
+  plain pipes: `IsInputRedirected=True`, `IsOutputRedirected=True`,
+  `UserInteractive=False`. So there is no console echo or VT injection
+  beyond the host's own line echo, which the helper already mutes.
+- **No deadlock on the bootstrap.** The 50 KiB line goes through
+  unspooled; the whole handshake takes **~470 ms**. The ssh channel window
+  is indeed large enough, so the local 4 KiB pipe deadlock is an artifact
+  of driving PowerShell as a subprocess and not something the transport
+  has to defend against.
+- **What sshd passes for an `exec` request:**
+  `powershell.exe -c "<command>"`. So the POSIX dialer's `exec /bin/sh`
+  reaches PowerShell as its `-Command` argument — which is what the flavor
+  fallback exists for, and which produced defect 9.
+
+**Defect 9 — the fallback still could not fire, for a second reason.**
+Defect 8 was found by driving an interactive PowerShell locally, where the
+peer stays alive and silent, so the fix for it was a silence timeout. A
+real peer behaves differently: `powershell.exe -c "exec /bin/sh"` fails to
+parse, prints to stderr — discarded by the dialer — and **exits**, closing
+the channel. The handshake comes back in **432 ms with `EOF`**, which
+`isHandshakeFailure` did not recognize, so `establishWithFallback` returned
+that error rather than trying the PowerShell flavor.
+
+Fixed in `67abcce`: an EOF during the handshake now counts as a wrong
+flavor. The dial has already succeeded by then, so a hangup there is a
+shell that would not stay, not a network that will not carry. Verified end
+to end on the live channel — POSIX attempt fails in 432 ms, PowerShell
+attempt then serves requests and `pwd` answers.
+
+Both fixes are worth keeping: `ReadyTimeout` covers a peer that stays alive
+and says nothing, the EOF check covers a peer that hangs up. Only the
+second one occurs with the current sshd defaults.
+
 ## Known-still-broken
 
-**The ssh lane still has not run.** `DefaultShell` is now set to
-`powershell.exe`, but key authentication is not in place: this account is
-in the administrators group, so sshd reads
-`__PROGRAMDATA__/ssh/administrators_authorized_keys` (per the `Match Group
-administrators` block in `sshd_config`), and that file does not exist —
-`ssh -o BatchMode=yes localhost` answers *Permission denied
-(publickey,password,keyboard-interactive)*. Creating it is the one step
-still outstanding.
+Nothing blocking is left. Two loose ends, both harmless:
 
-The remaining step (the sandbox refuses this edit, so it has to be run by
-hand):
-
-```powershell
-$pub = Get-Content "$env:USERPROFILE\.ssh\id_ed25519.pub"
-Add-Content 'C:\ProgramData\ssh\administrators_authorized_keys' $pub
-icacls 'C:\ProgramData\ssh\administrators_authorized_keys' /inheritance:r `
-    /grant 'Administrators:F' /grant 'SYSTEM:F'
-```
-
-Two things need checking there that the local pipe cannot answer: whether
-sshd allocates a ConPTY for the session (a real console would bring back
-echo and VT sequences the mute does not cover), and what sshd actually
-passes to PowerShell for an `exec` request.
-
-**A 50 KiB bootstrap line can deadlock a small pipe.** The console host
-echoes the whole line back before the helper mutes stdout, and a 4 KiB
-Windows pipe fills before the client has written it all; the probe spools
-its writes to get past this. An ssh channel's window is large enough that
-it should not appear there, but a transport that writes the bootstrap
-synchronously and only then starts reading is relying on that.
+**Symlinks were not tested.** Creating one needs a privilege this account
+does not have by default, so only `rdlink`'s refusal on a plain file was
+checked.
 
 **`Get-RootEntries` has a dead branch.** The `if (-not $d.IsReady)` body
 contains only a comment, so an unready drive is listed like any other.
@@ -373,9 +387,8 @@ feature list all held up under test and were not touched.
    also carries checks the test does not: grep/lidx offsets against a
    CRLF file, scan/hash totals, the mutations, and the error paths —
    defects 4–7 live there.
-2. **Run the ssh lane** once the key is authorized, specifically looking
-   for a ConPTY and for what sshd passes to PowerShell on an `exec`
-   request.
+2. **Re-run the ssh lane against a non-loopback host.** Everything in § 4
+   went over `localhost`, so latency, MTU and a slow login are untested.
 3. **Consider compressing the helper.** At 38 KiB compacted the bootstrap
    line is 50 KiB, which is over the 32 KiB Windows command-line limit —
    so a transport that ever wants to pass it as an argument rather than on
