@@ -971,34 +971,81 @@ function Cmd-Grep {
             $rx = New-Object System.Text.RegularExpressions.Regex($pat, $opts)
         }
 
+        $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase }
+               else     { [System.StringComparison]::Ordinal }
+
         $fs = [System.IO.File]::Open($win, [System.IO.FileMode]::Open,
                                      [System.IO.FileAccess]::Read,
                                      [System.IO.FileShare]::ReadWrite)
         try {
-            # Line-by-line scan tracking byte offsets.
-            $sr = New-Object System.IO.StreamReader($fs, $utf8NoBom, $false, 65536, $true)
+            # The file is walked as the byte stream it is rather than through
+            # a StreamReader: the reader hides how long a line's terminator
+            # was, and on a CRLF file — the common case here — every offset
+            # after the first line would be short by one byte per line.
+            # A CR before the LF stays part of the line, which is what grep
+            # sees too.
+            $buf  = New-Object 'byte[]' 65536
+            $acc  = New-Object System.IO.MemoryStream
             $count = 0
-            $offset = 0L
-            while (($line = $sr.ReadLine()) -ne $null) {
-                $hit = $false
-                if ($mode -eq 'fixed') {
-                    $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase }
-                           else     { [System.StringComparison]::Ordinal }
-                    $hit = $line.IndexOf($pat, $cmp) -ge 0
-                } else {
-                    $hit = $rx.IsMatch($line)
+            $lineStart = 0L
+            $pos = 0L
+            $stop = $false
+            while (-not $stop) {
+                $got = $fs.Read($buf, 0, $buf.Length)
+                if ($got -le 0) { break }
+                for ($i = 0; $i -lt $got; $i++) {
+                    if ($buf[$i] -ne 0x0A) { $acc.WriteByte($buf[$i]); continue }
+                    $count = Emit-GrepHits $acc $lineStart $pat $rx $cmp $count $limit
+                    $acc.SetLength(0)
+                    $lineStart = $pos + $i + 1
+                    if ($count -ge $limit) { $stop = $true; break }
                 }
-                if ($hit) {
-                    Write-Line ([string]$offset)
-                    $count++
-                    if ($count -ge $limit) { break }
-                }
-                $lineBytes = $utf8NoBom.GetByteCount($line)
-                $offset += $lineBytes + 1   # + LF terminator
+                $pos += $got
+            }
+            # A last line without a trailing LF still counts, as it does for
+            # grep.
+            if (-not $stop -and $acc.Length -gt 0) {
+                [void](Emit-GrepHits $acc $lineStart $pat $rx $cmp $count $limit)
             }
         } finally { $fs.Dispose() }
         Write-Ok
     } catch { Write-Err $_.Exception.Message }
+}
+
+# Emits one offset per match inside a single line, the way "grep -a -b -o"
+# does: the offset of the match itself, not of the line holding it, and one
+# line of output per match. Returns the running match count.
+function Emit-GrepHits {
+    param(
+        [System.IO.MemoryStream]$acc,
+        [int64]$lineStart,
+        [string]$pat,
+        $rx,
+        [System.StringComparison]$cmp,
+        [int]$count,
+        [int]$limit
+    )
+    if ($count -ge $limit) { return $count }
+    $text = $utf8NoBom.GetString($acc.ToArray())
+    if ($null -ne $rx) {
+        foreach ($m in $rx.Matches($text)) {
+            Write-Line ([string]($lineStart + $utf8NoBom.GetByteCount($text.Substring(0, $m.Index))))
+            $count++
+            if ($count -ge $limit) { return $count }
+        }
+        return $count
+    }
+    if ($pat.Length -eq 0) { return $count }
+    $from = 0
+    while ($from -le $text.Length - $pat.Length) {
+        $j = $text.IndexOf($pat, $from, $cmp)
+        if ($j -lt 0) { break }
+        Write-Line ([string]($lineStart + $utf8NoBom.GetByteCount($text.Substring(0, $j))))
+        $count++
+        if ($count -ge $limit) { return $count }
+        $from = $j + $pat.Length
+    }
+    return $count
 }
 
 # ---------------------------------------------------------------------
