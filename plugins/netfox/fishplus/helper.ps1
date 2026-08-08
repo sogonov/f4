@@ -1422,6 +1422,24 @@ function Get-JobDir([string]$idArg) {
     return $d
 }
 
+# Every read of a job's files goes through these two: the job is writing to
+# the same files at the same time, and a reader that does not allow a
+# concurrent writer fails outright with a sharing violation. [IO.File]'s
+# ReadLines and ReadAllText do exactly that, which made a poll of a running
+# job fail with "the process cannot access the file" instead of returning
+# what had been written so far.
+function Open-SharedReader([string]$path) {
+    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+                                 [System.IO.FileAccess]::Read,
+                                 [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    return New-Object System.IO.StreamReader($fs, $utf8NoBom)
+}
+
+function Read-SharedText([string]$path) {
+    $sr = Open-SharedReader $path
+    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+
 function Cmd-JPoll {
     param([string]$idArg, [string]$limArg)
     try {
@@ -1439,12 +1457,12 @@ function Cmd-JPoll {
             $state = 'kill'
         } elseif (Test-Path -LiteralPath $rcP) {
             $state = 'done'
-            $rcText = [System.IO.File]::ReadAllText($rcP, $utf8NoBom).Trim()
+            $rcText = (Read-SharedText $rcP).Trim()
             if (Test-IsUInt $rcText) { $rc = $rcText } else { $rc = '-' }
             if ($rc -ne '0' -and (Test-Path -LiteralPath $errP)) {
-                foreach ($ln in [System.IO.File]::ReadLines($errP, $utf8NoBom)) {
-                    $msg = $ln; break
-                }
+                $sr = Open-SharedReader $errP
+                try { $msg = $sr.ReadLine() } finally { $sr.Dispose() }
+                if ($null -eq $msg) { $msg = '' }
             }
         }
         $sLine = "S $state $rc"
@@ -1453,13 +1471,25 @@ function Cmd-JPoll {
 
         # How many whole lines have been emitted so far, and how many we
         # already gave the caller (persisted in $nP).
+        # Only whole lines count, so the count is the number of LFs, the same
+        # thing "wc -l" gives the POSIX helper. A job that is halfway through
+        # writing a line has not written its LF yet, and that half line stays
+        # invisible until it is complete.
         $tot = 0L
         if (Test-Path -LiteralPath $outP) {
-            foreach ($ln in [System.IO.File]::ReadLines($outP, $utf8NoBom)) { $tot++ }
+            $sr = Open-SharedReader $outP
+            try {
+                $cbuf = New-Object 'char[]' 8192
+                while (($cn = $sr.Read($cbuf, 0, $cbuf.Length)) -gt 0) {
+                    for ($i = 0; $i -lt $cn; $i++) {
+                        if ($cbuf[$i] -eq "`n") { $tot++ }
+                    }
+                }
+            } finally { $sr.Dispose() }
         }
         $done = 0L
         if (Test-Path -LiteralPath $nP) {
-            $t = [System.IO.File]::ReadAllText($nP, $utf8NoBom).Trim()
+            $t = (Read-SharedText $nP).Trim()
             if (Test-IsUInt $t) { $done = [int64]$t }
         }
         $avail = $tot - $done
@@ -1467,13 +1497,19 @@ function Cmd-JPoll {
             if ($avail -gt $limit) { $avail = $limit }
             $skip = $done
             $sent = 0
-            foreach ($ln in [System.IO.File]::ReadLines($outP, $utf8NoBom)) {
-                if ($skip -gt 0) { $skip--; continue }
-                Write-Line $ln
-                $sent++
-                if ($sent -ge $avail) { break }
-            }
-            [System.IO.File]::WriteAllText($nP, ($done + $avail).ToString(), $utf8NoBom)
+            $sr = Open-SharedReader $outP
+            try {
+                while ($sent -lt $avail) {
+                    $ln = $sr.ReadLine()
+                    if ($null -eq $ln) { break }
+                    if ($skip -gt 0) { $skip--; continue }
+                    Write-Line $ln
+                    $sent++
+                }
+            } finally { $sr.Dispose() }
+            # What was actually sent, not what was hoped for: a short read
+            # here would otherwise skip lines on the next poll forever.
+            [System.IO.File]::WriteAllText($nP, ($done + $sent).ToString(), $utf8NoBom)
         }
         Write-Ok
     } catch { Write-Err $_.Exception.Message }
@@ -1520,7 +1556,7 @@ function Cmd-JList {
                 $kind = ''
                 $kP = Join-Path $d 'kind'
                 if (Test-Path -LiteralPath $kP) {
-                    $kind = [System.IO.File]::ReadAllText($kP, $utf8NoBom).Trim()
+                    $kind = (Read-SharedText $kP).Trim()
                 }
                 Write-Line "$id $state $kind"
             }
