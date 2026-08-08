@@ -37,25 +37,41 @@ if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
     Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue
 }
 
+# The encoding the console host decodes stdin with. It has to be read
+# before anything else touches the console, because it is the key that
+# turns a line the host handed us back into the bytes that arrived on the
+# wire: the host decodes stdin with its own code page (cp866, cp1252, ...)
+# and never asks us. Reversing that decoding is what keeps a UTF-8 path
+# byte-exact. [Console]::InputEncoding is deliberately NOT set: the host's
+# line reader captured its encoding at startup and ignores later changes,
+# so setting it would only desynchronize this key from reality.
+$F4HostEnc = [Console]::InputEncoding
+
 # UTF-8 without BOM on stdout; a BOM at the start of the banner would
 # ruin the terminator's "starts a line" property.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try {
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [Console]::OutputEncoding = $utf8NoBom
-    [Console]::InputEncoding  = $utf8NoBom
     $OutputEncoding           = $utf8NoBom
 } catch { }
 
-# The line-oriented writer must emit "`n" rather than "`r`n": the Go
-# client tolerates CRLF but every non-terminator payload line would then
-# carry a stray CR that some downstream parsers would keep.
-try { [Console]::Out.NewLine = "`n" } catch { }
+# Silence the console host's own writer. Two things go through it that
+# would corrupt the wire: the prompt it paints between commands, and the
+# echo of every line it reads for us when stdin is a pipe. Nothing in this
+# helper prints through it — every byte we emit goes to the raw stdout
+# stream below — so muting it costs nothing and removes both hazards.
+try { [Console]::SetOut([System.IO.TextWriter]::Null) } catch { }
 
 # Raw byte streams. Everything binary — the "#<n>" frame during read,
 # the base64 payload line during write — goes through these to bypass
 # PS's text pipeline entirely. Wrap stdout in a buffered stream so the
 # terminator is emitted as a single Write, not a syscall per character.
-$F4In       = [Console]::OpenStandardInput()
+#
+# stdin is deliberately NOT opened here. Merely opening it costs bytes:
+# the stream buffers whatever has arrived, and those bytes then belong to
+# neither reader — the console host cannot see them and we never ask for
+# them once the host turns out to be the one doing the reading. It is
+# opened on first use instead, which only happens where stdin is ours.
 $F4RawOut   = [Console]::OpenStandardOutput()
 $F4Out      = New-Object System.IO.BufferedStream($F4RawOut, 65536)
 $F4LF       = [byte]0x0A
@@ -226,13 +242,41 @@ function Write-Err([string]$msg) { Write-End 'err' $msg }
 # Reads one LF-terminated line from stdin as raw bytes, decoded UTF-8.
 # Returns $null on EOF. The buffered read matches what helper.sh sees
 # from "IFS= read -r".
+#
+# Which of the two paths below is usable is decided by the host, not by us.
+# A console host with a redirected stdin keeps a read pending on that handle
+# for its own line reader, and it wins every race: bytes that arrive after
+# the helper started are consumed by the host and a stream read here blocks
+# forever. So the host's reader is asked first, and the raw stream is used
+# only where the host refuses to read at all (-NonInteractive), which is the
+# standalone case where nothing competes for stdin anyway.
 $script:F4LineBuf = New-Object System.IO.MemoryStream
+$script:F4ReadMode = $null      # 'host' | 'stream'
 
-function Read-LineBytes {
+# One line through the host's reader, converted back to the bytes that
+# arrived. Returns $null on EOF; the host strips the line terminator
+# itself, CR included.
+function Read-HostLineBytes {
+    $line = $host.UI.ReadLine()
+    if ($null -eq $line) { return $null }
+    return $F4HostEnc.GetBytes($line)
+}
+
+# Opens stdin the first time a stream read needs it. See the note at the
+# top: opening it eagerly would swallow bytes the console host is meant
+# to hand us.
+$script:F4In = $null
+function Get-StdIn {
+    if ($null -eq $script:F4In) { $script:F4In = [Console]::OpenStandardInput() }
+    return $script:F4In
+}
+
+function Read-StreamLineBytes {
+    $in = Get-StdIn
     $script:F4LineBuf.SetLength(0)
     $one = New-Object 'byte[]' 1
     while ($true) {
-        $n = $F4In.Read($one, 0, 1)
+        $n = $in.Read($one, 0, 1)
         if ($n -le 0) {
             if ($script:F4LineBuf.Length -eq 0) { return $null }
             break
@@ -242,6 +286,22 @@ function Read-LineBytes {
         $script:F4LineBuf.WriteByte($one[0])
     }
     return $script:F4LineBuf.ToArray()
+}
+
+function Read-LineBytes {
+    if ($null -eq $script:F4ReadMode) {
+        # The probe doubles as the first read: a host that answers has
+        # already consumed the line, so it must not be read twice.
+        try {
+            $b = Read-HostLineBytes
+            $script:F4ReadMode = 'host'
+            return $b
+        } catch {
+            $script:F4ReadMode = 'stream'
+        }
+    }
+    if ($script:F4ReadMode -eq 'host') { return Read-HostLineBytes }
+    return Read-StreamLineBytes
 }
 
 function Read-Line {
@@ -268,12 +328,22 @@ function Read-PathLine {
 }
 
 # Read the exact requested number of bytes from stdin.
+#
+# Only reachable while stdin belongs to us. Once the console host is doing
+# the reading there is no byte-exact path left — the host hands out whole
+# decoded lines and nothing smaller — so a raw payload is refused instead
+# of being half-read. The client never asks for one: the banner announces
+# write:b64, and wmode accepts nothing else.
 function Read-ExactBytes([int]$n) {
+    if ($script:F4ReadMode -eq 'host') {
+        throw 'raw payloads need byte-exact stdin, which this host does not give; use b64'
+    }
     if ($n -le 0) { return [byte[]]@() }
+    $in = Get-StdIn
     $buf = New-Object 'byte[]' $n
     $off = 0
     while ($off -lt $n) {
-        $r = $F4In.Read($buf, $off, $n - $off)
+        $r = $in.Read($buf, $off, $n - $off)
         if ($r -le 0) { throw 'eof during payload' }
         $off += $r
     }
