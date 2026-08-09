@@ -1698,10 +1698,18 @@ function Cmd-JStart {
 
                         $count = 0
                         $scanned = 0L
+                        # Emit progress at a wall-clock cadence rather than
+                        # per-N-files: a content-search over big files can
+                        # be dozens of seconds per file, and a per-500 rule
+                        # would leave the dialog frozen at the initial path
+                        # for minutes. 300 ms is snappy without spamming the
+                        # poll for a fast walk.
+                        $emitInterval = [TimeSpan]::FromMilliseconds(300)
+                        $lastEmit = [DateTime]::UtcNow
                         $stack = New-Object System.Collections.Generic.Stack[string]
                         $stack.Push($dir)
                         :outer while ($stack.Count -gt 0 -and $count -lt $limit) {
-                            if (Test-Path -LiteralPath $killPath) { break outer }
+                            if ([System.IO.File]::Exists($killPath)) { break outer }
                             $cur = $stack.Pop()
                             $files = $null
                             try { $files = [System.IO.Directory]::EnumerateFiles($cur) } catch { }
@@ -1712,16 +1720,22 @@ function Cmd-JStart {
                                     try { $fi = New-Object System.IO.FileInfo $fp } catch { continue }
                                     if ($fi.Attributes -band $reparse) { continue }
                                     $scanned++
-                                    if (($scanned % 500) -eq 0) {
-                                        # P line: last-visited path plus
-                                        # running counters. Format matches
-                                        # what parseFFindProgress expects on
-                                        # the client side.
+                                    # Time-based P line: emitted whenever
+                                    # more than $emitInterval has passed
+                                    # since the last one, so the dialog
+                                    # gets a live pulse no matter how slow
+                                    # or fast the walk is. Also the cheapest
+                                    # place to look for the kill sentinel
+                                    # so cancel latency matches the emit
+                                    # cadence.
+                                    $tickNow = [DateTime]::UtcNow
+                                    if (($tickNow - $lastEmit) -ge $emitInterval) {
+                                        $lastEmit = $tickNow
                                         $wp = ''
                                         try { $wp = $fi.FullName.Replace('\', '/') } catch { }
                                         $out.WriteLine("P $scanned $count $wp")
                                         $out.Flush()
-                                        if (Test-Path -LiteralPath $killPath) { break outer }
+                                        if ([System.IO.File]::Exists($killPath)) { break outer }
                                     }
                                     # Mask match on the bare name.
                                     $ok = $false

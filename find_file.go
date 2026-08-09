@@ -82,7 +82,11 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 		// scanned so far and how many have matched. During the walk
 		// found is still empty on our side, so the "Found:" line has to
 		// prefer the reported number until the final answer lands.
+		// remotePath is what a remote progress last reported as the
+		// head of the walk; the "final" updateUI at the end otherwise
+		// reverts the label to startDir and loses the last frame.
 		var remoteFound int64
+		var remotePath string
 
 		updateUI := func(dir string, force bool) {
 			now := time.Now()
@@ -92,7 +96,11 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 				if remoteFound > currentCount {
 					currentCount = remoteFound
 				}
-				displayDir := runewidth.Truncate(dir, 56, "...")
+				showDir := dir
+				if remotePath != "" {
+					showDir = remotePath
+				}
+				displayDir := runewidth.Truncate(showDir, 56, "...")
 				ctx.RunOnUI(func() {
 					lblDir.SetText(Msg("FindFile.Scanning") + " " + displayDir)
 					lblFound.SetText(fmt.Sprintf(Msg("FindFile.FoundCount"), currentCount))
@@ -167,13 +175,17 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 				IgnoreCase: true,
 				Limit:      maxRemoteFindResults,
 				// A remote finder that supports progress reports the
-				// last path it visited and running counters. Route it
-				// through updateUI so the throttle here matches what
-				// the local walk does — no need for a separate rate
-				// limiter on the callback side.
+				// last path it visited and running counters. Force the
+				// redraw (helper's own P cadence is 300 ms, well above
+				// the client-side throttle, so nothing to save here)
+				// and remember the path so the final updateUI at the
+				// end does not revert the label back to startDir.
 				Progress: func(p vfs.FindProgress) {
 					remoteFound = p.Found
-					updateUI(p.Path, false)
+					if p.Path != "" {
+						remotePath = p.Path
+					}
+					updateUI(p.Path, true)
 				},
 			})
 			if findErr == nil {

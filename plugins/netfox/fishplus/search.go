@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -170,7 +171,7 @@ func (c *Client) Find(ctx context.Context, dir string, opts FindOptions) ([]Entr
 		gmode = GrepOptions{Fixed: opts.Fixed, IgnoreCase: opts.IgnoreCase}.mode()
 	}
 
-	if c.sess.Features().Has("ffindjob") && c.CanRunJobs() {
+	if c.sess.Features().Has("ffindjob") && c.CanRunJobs() && os.Getenv("F4_NO_FFINDJOB") == "" {
 		return c.findViaJob(ctx, dir, masks, opts.Text, gmode, limit, opts.Progress)
 	}
 
