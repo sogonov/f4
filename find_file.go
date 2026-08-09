@@ -77,12 +77,21 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 		searchTextLower := strings.ToLower(text)
 		var found []FoundFile
 		var lastUpdate time.Time // Used for throttling UI redraws
+		// A remote finder that supports progress reports intermediate
+		// counters before we get the entries themselves: what has been
+		// scanned so far and how many have matched. During the walk
+		// found is still empty on our side, so the "Found:" line has to
+		// prefer the reported number until the final answer lands.
+		var remoteFound int64
 
 		updateUI := func(dir string, force bool) {
 			now := time.Now()
 			if force || now.Sub(lastUpdate) > 50*time.Millisecond {
 				lastUpdate = now
-				currentCount := len(found) // Always use the actual length of the slice
+				currentCount := int64(len(found))
+				if remoteFound > currentCount {
+					currentCount = remoteFound
+				}
 				displayDir := runewidth.Truncate(dir, 56, "...")
 				ctx.RunOnUI(func() {
 					lblDir.SetText(Msg("FindFile.Scanning") + " " + displayDir)
@@ -157,6 +166,15 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 				Text:       text,
 				IgnoreCase: true,
 				Limit:      maxRemoteFindResults,
+				// A remote finder that supports progress reports the
+				// last path it visited and running counters. Route it
+				// through updateUI so the throttle here matches what
+				// the local walk does — no need for a separate rate
+				// limiter on the callback side.
+				Progress: func(p vfs.FindProgress) {
+					remoteFound = p.Found
+					updateUI(p.Path, false)
+				},
 			})
 			if findErr == nil {
 				for _, hit := range hits {

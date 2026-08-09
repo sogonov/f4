@@ -869,13 +869,28 @@ func (v *FishVFS) Search(ctx context.Context, p, pattern string) (chan int64, er
 // A symlink is reported as found without resolving it: the alternative is a
 // round trip per hit, which would give back what the whole command saves.
 func (v *FishVFS) FindFiles(ctx context.Context, dir string, q vfs.FindQuery) ([]vfs.FoundEntry, error) {
-	entries, err := v.client().Find(ctx, v.abs(dir), fishplus.FindOptions{
+	opts := fishplus.FindOptions{
 		Masks:      q.Masks,
 		Text:       q.Text,
 		Fixed:      true,
 		IgnoreCase: q.IgnoreCase,
 		Limit:      q.Limit,
-	})
+	}
+	// The client's Progress speaks fishplus.FindProgress; the caller
+	// asked for vfs.FindProgress. One field-for-field bridge, so a
+	// panel dialog that plumbs a progress callback through FindQuery
+	// gets P lines from a Windows peer without knowing anything about
+	// job protocols.
+	if q.Progress != nil {
+		opts.Progress = func(p fishplus.FindProgress) {
+			q.Progress(vfs.FindProgress{
+				Scanned: p.Scanned,
+				Found:   p.Found,
+				Path:    p.Path,
+			})
+		}
+	}
+	entries, err := v.client().Find(ctx, v.abs(dir), opts)
 	if err != nil {
 		return nil, err
 	}
