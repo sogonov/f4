@@ -979,14 +979,16 @@ func (v *FishVFS) PtyInterrupt() []byte {
 //
 // $E is cmd's PROMPT syntax for ESC; $E\ is the OSC ST terminator
 // (\x1b\); $P and $G are the standard current-path-and-'>' pieces. The
-// leading @ suppresses cmd's echo of the prompt-setup line itself in
-// batch contexts; interactive cmd may still print it once — one
-// cosmetic echo at connect time is a small price.
+// leading @ suppresses cmd's echo of the prompt-setup line in batch
+// contexts; interactive cmd on ConPTY still echoes it, so the second
+// half of the line is a cls that wipes the cmd banner + copyright +
+// the echoed setup line, leaving the panel-terminal view starting on
+// the first marker-embedded prompt with no visible init noise.
 func (v *FishVFS) PtyInitSequence() []byte {
 	if !v.peerIsWindows() {
 		return nil
 	}
-	return []byte("@prompt $E]133;D$E\\$P$G\r")
+	return []byte("@prompt $E]133;D$E\\$P$G & cls\r")
 }
 
 // peerIsWindows reports whether the FISH+ helper on the peer announced
