@@ -1100,45 +1100,72 @@ function Cmd-LineIdx {
     } catch { Write-Err $_.Exception.Message }
 }
 
-# Decides whether a file should be opened for content search. .NET's
-# StreamReader.ReadLine — which [System.IO.File]::ReadLines drives —
-# reads up to the next 0x0A byte before returning. On a binary file
-# (video, disk image, model dump) that byte may be gigabytes away, so
-# a single "line" allocation ends up buying the whole file into memory
-# — a real report from an Alt+F7 across C:\Users had powershell.exe
-# swell to 1-2 GB. helper.sh sidesteps this by piping through grep -a,
-# which is byte-based; there is no byte-based .NET equivalent that is
-# nearly as cheap.
+# Byte-level content search over a file. Reads it in fixed chunks and
+# does the match on each chunk after decoding through ISO-8859-1 — the
+# only byte-transparent single-byte .NET encoding, where every byte b
+# becomes the char U+00b. That lets .NET's native String.IndexOf and
+# Regex.IsMatch run over the raw bytes without ever loading the whole
+# file, which is what grep -a does with its 32 KB read buffer. A
+# previous size-cap approach here was working around symptoms; this is
+# the actual fix. Runs at wire speed even against multi-gigabyte
+# binaries and keeps the helper's RSS at the buffer size.
 #
-# The check is a size cap plus a NUL-byte sniff on the first few KB —
-# text files essentially never have NUL bytes in their prose, so any
-# meaningful count of them means the file is binary and is skipped
-# regardless of size. Text files still get searched up to a generous
-# cap (log files can be 100 MB and are worth searching), above which
-# they too are skipped to keep the worst case bounded.
-$F4ContentMaxSize   = 512MB   # cap for text-like files
-$F4ContentBlobLimit = 2GB     # above this, don't even bother sniffing
-$F4ContentSniffLen  = 4096    # bytes to peek for NUL detection
-function Test-ContentSearchable {
-    param([System.IO.FileInfo]$fi)
-    if ($fi.Length -eq 0) { return $true }
-    if ($fi.Length -gt $F4ContentBlobLimit) { return $false }
-    $want = [int]([Math]::Min([int64]$F4ContentSniffLen, $fi.Length))
-    $head = New-Object 'byte[]' $want
-    $read = 0
+# The pattern gets the same UTF-8 -> ISO-8859-1 round-trip so that a
+# Cyrillic search string is matched as its UTF-8 byte sequence in a
+# UTF-8-encoded file, matching grep's default byte semantics. Regex
+# meta-characters are ASCII and survive the round-trip untouched.
+# Regex character classes referring to non-ASCII code points (rare in
+# file-manager searches) may fail to match after the transform; that
+# is a documented limitation shared with grep in POSIX locales.
+$F4ContentChunkSize = 1MB
+$F4ContentRxOverlap = 8192    # keeps a regex match up to this long across chunk boundary
+$F4Latin1 = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1, byte-preserving
+$F4Utf8Bare = [System.Text.UTF8Encoding]::new($false)
+
+function ConvertTo-BytePreservingPattern([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    return $F4Latin1.GetString($F4Utf8Bare.GetBytes($s))
+}
+
+function Test-FileContainsPattern {
+    param(
+        [string]$path,
+        [string]$fixedPat,    # non-null when fixed-string search
+        $rx,                  # System.Text.RegularExpressions.Regex, or $null
+        [bool]$ci             # only meaningful when fixedPat is used
+    )
+    $fixed = -not [string]::IsNullOrEmpty($fixedPat)
+    if (-not $fixed -and $null -eq $rx) { return $false }
+    $overlap = if ($fixed) { [Math]::Max(0, $fixedPat.Length - 1) } else { $F4ContentRxOverlap }
+    $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+    $fs = $null
     try {
-        $fs = [System.IO.File]::Open($fi.FullName, [System.IO.FileMode]::Open,
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
                                      [System.IO.FileAccess]::Read,
                                      [System.IO.FileShare]::ReadWrite)
-        try { $read = $fs.Read($head, 0, $want) } finally { $fs.Dispose() }
-    } catch { return $false }
-    $nulls = 0
-    for ($i = 0; $i -lt $read; $i++) { if ($head[$i] -eq 0) { $nulls++ } }
-    # 1% NUL bytes in the head is well above what any text file has and
-    # well below what any binary has, so it separates them cleanly.
-    if ($nulls -gt ($read / 100)) { return $false }
-    if ($fi.Length -gt $F4ContentMaxSize) { return $false }
-    return $true
+        $buf = New-Object 'byte[]' ($F4ContentChunkSize + $overlap)
+        $carry = 0
+        while ($true) {
+            $got = $fs.Read($buf, $carry, $F4ContentChunkSize)
+            if ($got -le 0) { return $false }
+            $have = $carry + $got
+            $chunk = $F4Latin1.GetString($buf, 0, $have)
+            if ($fixed) {
+                if ($chunk.IndexOf($fixedPat, $cmp) -ge 0) { return $true }
+            } else {
+                if ($rx.IsMatch($chunk)) { return $true }
+            }
+            if ($overlap -gt 0 -and $have -gt $overlap) {
+                [Array]::Copy($buf, $have - $overlap, $buf, 0, $overlap)
+                $carry = $overlap
+            } else {
+                $carry = 0
+            }
+        }
+    } catch { return $false } finally {
+        if ($null -ne $fs) { $fs.Dispose() }
+    }
+    return $false
 }
 
 # ---------------------------------------------------------------------
@@ -1178,17 +1205,22 @@ function Cmd-FFind {
         $dir = Convert-PosixToWin $dirWire
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { Write-Err 'not a directory'; return }
         Emit-ModeLine
+        # Both fixed and regex searches operate on the file's bytes
+        # after decoding through ISO-8859-1 — a byte-preserving
+        # encoding — so the pattern travels through the same round-trip
+        # to make sure a Cyrillic search string is matched as the UTF-8
+        # bytes a UTF-8 file actually stores.
+        $bytePat = ConvertTo-BytePreservingPattern $pat
         $rx = $null
         if ($pat -ne $null -and -not $fixed) {
             $opts = [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
             if ($ci) { $opts = $opts -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
-            $rx = New-Object System.Text.RegularExpressions.Regex($pat, $opts)
+            $rx = New-Object System.Text.RegularExpressions.Regex($bytePat, $opts)
         }
         $count = 0
         $stack = New-Object System.Collections.Generic.Stack[string]
         $stack.Push($dir)
         $reparse = [System.IO.FileAttributes]::ReparsePoint
-        $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
         :outer while ($stack.Count -gt 0 -and $count -lt $limit) {
             $cur = $stack.Pop()
             $files = $null
@@ -1206,22 +1238,8 @@ function Cmd-FFind {
                     }
                     if (-not $ok) { continue }
                     if ($pat -ne $null) {
-                        # Cheap sniff to avoid reading a whole binary
-                        # as a single "line" — see Test-ContentSearchable.
-                        if (-not (Test-ContentSearchable $fi)) { continue }
-                        $hit = $false
-                        try {
-                            if ($fixed) {
-                                foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
-                                    if ($ln.IndexOf($pat, $cmp) -ge 0) { $hit = $true; break }
-                                }
-                            } else {
-                                foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
-                                    if ($rx.IsMatch($ln)) { $hit = $true; break }
-                                }
-                            }
-                        } catch { $hit = $false }
-                        if (-not $hit) { continue }
+                        $fixedArg = if ($fixed) { $bytePat } else { $null }
+                        if (-not (Test-FileContainsPattern $fi.FullName $fixedArg $rx $ci)) { continue }
                     }
                     # For a tree search the client wants the FULL wire
                     # path in the name field of the entry.
