@@ -53,10 +53,11 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 	// the size the field will ever need.
 	lblMask := vtui.NewLabel(0, 0, padLabelTo(Msg("FindFile.MaskPrompt")+" "+mask, 56), nil)
 	lblDir := vtui.NewLabel(0, 0, padLabelTo(Msg("FindFile.Scanning")+" ...", 56), nil)
-	// lblFound sits in an hbox next to the Cancel button; 24 characters
-	// covers "Found: 999999999" and then some, and leaves the rest of
-	// the row for the button which AlignRight anchors at the far end.
-	lblFound := vtui.NewLabel(0, 0, padLabelTo(fmt.Sprintf(Msg("FindFile.FoundCount"), 0), 24), nil)
+	// lblFound sits in an hbox next to the Cancel button. 40 characters
+	// covers "Found: 999999 (scanned 999999999)" and then some, while
+	// still leaving the rest of the 56-cell row for the button which
+	// AlignRight anchors at the far end.
+	lblFound := vtui.NewLabel(0, 0, padLabelTo(fmt.Sprintf(Msg("FindFile.FoundCount"), 0), 40), nil)
 
 	btnCancel := vtui.NewButton(0, 0, Msg("vtui.Cancel"))
 
@@ -112,6 +113,7 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 		// head of the walk; the "final" updateUI at the end otherwise
 		// reverts the label to startDir and loses the last frame.
 		var remoteFound int64
+		var remoteScanned int64
 		var remotePath string
 
 		updateUI := func(dir string, force bool) {
@@ -127,9 +129,21 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 					showDir = remotePath
 				}
 				displayDir := runewidth.Truncate(showDir, 56, "...")
+				// A remote job reports how many entries the walk has
+				// visited; showing it next to "Found" gives the user
+				// a sense of progress even when the pattern is rare
+				// enough that the "Found" counter barely moves. The
+				// local walk does not report scanned separately (its
+				// pace is dominated by the ReadDir round trips it
+				// makes), so the parenthetical is only shown when a
+				// remote finder actually supplied a number.
+				foundText := fmt.Sprintf(Msg("FindFile.FoundCount"), currentCount)
+				if remoteScanned > 0 {
+					foundText = fmt.Sprintf("%s (scanned %d)", foundText, remoteScanned)
+				}
 				ctx.RunOnUI(func() {
 					lblDir.SetText(Msg("FindFile.Scanning") + " " + displayDir)
-					lblFound.SetText(fmt.Sprintf(Msg("FindFile.FoundCount"), currentCount))
+					lblFound.SetText(foundText)
 					vtui.FrameManager.Redraw()
 				})
 			}
@@ -208,6 +222,7 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 				// end does not revert the label back to startDir.
 				Progress: func(p vfs.FindProgress) {
 					remoteFound = p.Found
+					remoteScanned = p.Scanned
 					if p.Path != "" {
 						remotePath = p.Path
 					}
