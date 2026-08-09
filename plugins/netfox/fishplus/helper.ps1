@@ -1371,41 +1371,51 @@ function Cmd-JStart {
                         [System.IO.File]::AppendAllText($errPath, "empty command`n", $enc)
                         [System.IO.File]::WriteAllText($rcPath, '1', $enc); return
                     }
-                    $psi = New-Object System.Diagnostics.ProcessStartInfo
-                    $psi.FileName = 'cmd.exe'
-                    $psi.Arguments = '/d /c ' + $cmdText
-                    $psi.UseShellExecute = $false
-                    $psi.RedirectStandardOutput = $true
-                    $psi.RedirectStandardError  = $true
-                    # stdin has to be redirected and closed straight away.
-                    # Without it a child inherits the parent runspace's stdin,
-                    # which on the outer helper is the SSH channel: a program
-                    # that probes stdin (git checking isatty, ssh-agent,
-                    # anything that reads config from stdin) would swallow
-                    # bytes meant for the next protocol request, and one that
-                    # actually blocks on stdin would hang the whole job.
-                    # helper.sh does the same with "</dev/null" at the shell
-                    # level.
-                    $psi.RedirectStandardInput  = $true
-                    if ($null -ne $cwd) { $psi.WorkingDirectory = $cwd }
-                    $p = [System.Diagnostics.Process]::Start($psi)
-                    $p.StandardInput.Close()
-                    # stdout and stderr are drained concurrently: a program
-                    # that fills its stderr pipe (a couple of KB on Windows)
-                    # blocks writing until we consume it, and reading stdout
-                    # to end first would wait for a child that cannot get
-                    # there. Starting both ReadToEndAsync tasks before
-                    # WaitForExit is what keeps both pipes flowing.
-                    $outTask = $p.StandardOutput.ReadToEndAsync()
-                    $errTask = $p.StandardError.ReadToEndAsync()
-                    $p.WaitForExit()
-                    [System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask))
-                    $out = New-Object System.IO.StreamWriter($outPath, $false, $enc)
+                    # The user's command goes through a tiny batch file
+                    # that cmd runs with its OWN redirection: stdin from
+                    # NUL, stdout AND stderr into the output file, all at
+                    # the cmd level. PowerShell never touches the child's
+                    # pipes, so a program that fills its stderr faster
+                    # than we could drain it cannot deadlock us, and no
+                    # child inherits the SSH channel as stdin. This is
+                    # the exact shape helper.sh gives its exec job with
+                    # </dev/null > out 2>&1 at the shell level.
+                    #
+                    # An earlier attempt used RedirectStandardOutput /
+                    # RedirectStandardError + ReadToEndAsync + WaitAll to
+                    # drive the same idea from the PS side. It hangs
+                    # under a real Start-Job runspace on PS 5.1 — even
+                    # "clear" or "git -v" from the panel terminal never
+                    # return — so the whole read-side is out of the way
+                    # now.
+                    $jobDir = [System.IO.Path]::GetDirectoryName($outPath)
+                    $batch  = Join-Path $jobDir 'exec.cmd'
+                    # cmd wants CRLF and the local OEM code page. echo
+                    # off silences the batch prologue; exit /b relays the
+                    # last command's ERRORLEVEL back through cmd so our
+                    # WaitForExit sees the right number.
+                    $batchBody = "@echo off`r`n" + $cmdText + "`r`nexit /b %ERRORLEVEL%`r`n"
+                    [System.IO.File]::WriteAllText($batch, $batchBody, [System.Text.Encoding]::Default)
                     try {
-                        if (-not [string]::IsNullOrEmpty($outTask.Result)) { $out.Write($outTask.Result) }
-                        if (-not [string]::IsNullOrEmpty($errTask.Result)) { $out.Write($errTask.Result) }
-                    } finally { $out.Dispose() }
-                    [System.IO.File]::WriteAllText($rcPath, $p.ExitCode.ToString(), $enc)
+                        $comspec = $env:ComSpec
+                        if ([string]::IsNullOrEmpty($comspec)) { $comspec = 'cmd.exe' }
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = $comspec
+                        # cmd's /c strips one leading and one trailing
+                        # quote off the string it is given; every path we
+                        # substitute in is separately double-quoted so a
+                        # space in TEMP or in the working directory
+                        # survives the parse.
+                        $psi.Arguments = "/d /c `"call `"$batch`" < NUL > `"$outPath`" 2>&1`""
+                        $psi.UseShellExecute = $false
+                        $psi.CreateNoWindow  = $true
+                        if ($null -ne $cwd) { $psi.WorkingDirectory = $cwd }
+                        $p = [System.Diagnostics.Process]::Start($psi)
+                        $p.WaitForExit()
+                        [System.IO.File]::WriteAllText($rcPath, $p.ExitCode.ToString(), $enc)
+                    } finally {
+                        Remove-Item -LiteralPath $batch -Force -ErrorAction SilentlyContinue
+                    }
                 } catch {
                     [System.IO.File]::AppendAllText($errPath, $_.Exception.Message + "`n", $enc)
                     [System.IO.File]::WriteAllText($rcPath, '1', $enc)
