@@ -441,6 +441,17 @@ type PtyShellIntegration interface {
 	// literal Ctrl+C byte — since both cmd.exe over ConPTY and every
 	// POSIX shell treat that as SIGINT.
 	PtyInterrupt() []byte
+
+	// PtyInitSequence returns bytes to send to the PTY exactly once,
+	// right after it opens and before the caller sends anything else.
+	// A Windows peer uses this to install a PROMPT that embeds an OSC
+	// 133 D marker, matching what the local Windows PTY does — every
+	// time cmd shows the prompt (which is when the last command
+	// finished) the caller's OSC 133 handler is fired and the panel
+	// frame's OnBusyChange returns to panels. Returning nil means the
+	// shell needs no init, which is the honest answer for a POSIX
+	// peer whose command templates emit their own OSC 133.
+	PtyInitSequence() []byte
 }
 
 // LineIndexResult is what a LineIndexer answers with.

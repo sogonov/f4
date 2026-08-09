@@ -3014,6 +3014,18 @@ func (pf *PanelsFrame) getActivePTYUnsafe() PtyBackend {
 			vtui.DebugLog("Created new remote PTY background session for VFS")
 			pf.remotePtys[activeVfs] = pty
 
+			// Give the VFS one chance to install shell settings before
+			// anyone else writes to the PTY. FISH+ against a Windows
+			// peer sends "prompt $E]133;D$E\$P$G" so cmd's own prompt
+			// embeds an OSC 133 D marker on every command completion —
+			// otherwise the panel frame never sees "command done" and
+			// stays in terminal mode instead of returning to panels.
+			if integ, ok := activeVfs.(vfs.PtyShellIntegration); ok {
+				if init := integ.PtyInitSequence(); len(init) > 0 {
+					pty.Write(init)
+				}
+			}
+
 			go func() {
 				buf := make([]byte, 32768) // Увеличен буфер
 				for {

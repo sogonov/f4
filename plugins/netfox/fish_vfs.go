@@ -969,6 +969,26 @@ func (v *FishVFS) PtyInterrupt() []byte {
 	return []byte{0x03}
 }
 
+// PtyInitSequence implements vfs.PtyShellIntegration. On a Windows peer
+// it sets cmd's PROMPT so that every prompt cmd draws — every time a
+// command finishes — embeds an OSC 133 D marker. The ANSI parser in
+// terminal_view.go then fires OnBusyChange(false), which is what makes
+// panels_frame return to panels after a cmdline command completes. This
+// is the same trick panels_frame.go uses for the local Windows PTY
+// (see the os.Setenv("PROMPT", ...) around initPTY).
+//
+// $E is cmd's PROMPT syntax for ESC; $E\ is the OSC ST terminator
+// (\x1b\); $P and $G are the standard current-path-and-'>' pieces. The
+// leading @ suppresses cmd's echo of the prompt-setup line itself in
+// batch contexts; interactive cmd may still print it once — one
+// cosmetic echo at connect time is a small price.
+func (v *FishVFS) PtyInitSequence() []byte {
+	if !v.peerIsWindows() {
+		return nil
+	}
+	return []byte("@prompt $E]133;D$E\\$P$G\r")
+}
+
 // peerIsWindows reports whether the FISH+ helper on the peer announced
 // itself as PowerShell (flavor:pwsh feature). A Windows peer's PTY
 // channel is what needs cmd-shaped commands; a POSIX peer keeps the
