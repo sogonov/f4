@@ -1293,6 +1293,26 @@ func (pf *PanelsFrame) ProcessKey(e *vtinput.InputEvent) bool {
 	if e.VirtualKeyCode == vtinput.VK_C && alt && ctrl && e.KeyDown {
 		panic("Manual safe crash triggered by user (Ctrl+Alt+C) for testing!")
 	}
+
+	// Ctrl+C on a remote panel that carries a PTY-integration hint
+	// interrupts whatever is running on the far side, ahead of the
+	// Panel.SplitReset action bound to Ctrl+C globally. A user driving
+	// a remote command from the panel cmdline reaches for Ctrl+C to
+	// stop it; making them switch to the terminal view first (Ctrl+O)
+	// just to be heard would be worse than losing the split-reset
+	// binding on remote panels.
+	if e.KeyDown && ctrl && !alt && !shift && e.VirtualKeyCode == vtinput.VK_C {
+		if fsp := pf.getActivePanel(); fsp != nil {
+			if integ, ok := fsp.vfs.(vfs.PtyShellIntegration); ok {
+				if pty := pf.getActivePTY(); pty != nil {
+					if seq := integ.PtyInterrupt(); len(seq) > 0 {
+						pty.Write(seq)
+						return true
+					}
+				}
+			}
+		}
+	}
 	if e.Type == vtinput.FocusEventType {
 		pf.SetFocus(e.SetFocus)
 		// Reload macros from disk when regaining focus to share them across instances
@@ -1614,12 +1634,22 @@ func (pf *PanelsFrame) ProcessKey(e *vtinput.InputEvent) bool {
 			if activePty != nil {
 				var path string
 				isWindowsShell := runtime.GOOS == "windows"
+				var integration vfs.PtyShellIntegration
 				if fsp, ok := pf.panels[pf.activeIdx].(*FileSystemPanel); ok {
 					if _, isOS := fsp.vfs.(*vfs.OSVFS); isOS {
 						path = fsp.vfs.GetPath()
 					} else if vfsHasRemotePTY(fsp.vfs) {
 						path = fsp.vfs.GetPath()
 						isWindowsShell = false
+					}
+					// A VFS that carries its own PTY-shell templates
+					// takes over the wire-command composition. FISH+
+					// against a Windows peer takes this branch so the
+					// PTY (cmd.exe by default) gets syntax cmd actually
+					// parses — the bash-shaped OSC-133-wrapped template
+					// below would come through as literal noise.
+					if integ, ok2 := fsp.vfs.(vfs.PtyShellIntegration); ok2 {
+						integration = integ
 					}
 				}
 
@@ -1633,7 +1663,13 @@ func (pf *PanelsFrame) ProcessKey(e *vtinput.InputEvent) bool {
 					cmd = resolveWindowsCommand(cmd)
 				}
 
-				if isWindowsShell {
+				if integration != nil {
+					if seq := integration.PtyRunCommand(path, cmd); len(seq) > 0 {
+						fullWireCmd = string(seq)
+						pf.executing = true
+						pf.returnToPanels = pf.showPanels
+					}
+				} else if isWindowsShell {
 					// Use a combined command for reliable excision in AnsiParser: cd /d "path" & command
 					if path != "" {
 						fullWireCmd = fmt.Sprintf("cd /d \"%s\" & %s\r", path, cmd)
@@ -1664,11 +1700,18 @@ func (pf *PanelsFrame) ProcessKey(e *vtinput.InputEvent) bool {
 					}
 				}
 
-				if !isWindowsShell {
+				// Print the clean command in the local terminal echo
+				// so the user sees what was sent. OSC-133 mute is only
+				// safe for the shells that emit the matching D marker
+				// — the bash templates above do, cmd.exe and the
+				// integration path do not.
+				if !isWindowsShell && integration == nil {
 					pf.termView.PrintCleanCommand(cmd)
 					if !isBackground {
 						pf.termView.SetMuted(true)
 					}
+				} else if integration != nil {
+					pf.termView.PrintCleanCommand(cmd)
 				}
 				activePty.Write([]byte(fullWireCmd))
 			}
@@ -2915,16 +2958,29 @@ func (pf *PanelsFrame) syncPTYDirectory(path string, v vfs.VFS) bool {
 	}
 
 	activePty := pf.getActivePTY()
-	if activePty != nil {
-		if isWindowsShell {
-			activePty.Write([]byte(fmt.Sprintf("cd /d \"%s\" & rem f4_sync\r", path)))
-		} else {
-			sqPath := strings.ReplaceAll(path, "'", "'\\''")
-			activePty.Write([]byte(fmt.Sprintf(" cd '%s' # f4_sync\r", sqPath)))
+	if activePty == nil {
+		return false
+	}
+
+	// A VFS that knows what its own PTY speaks composes the sync line
+	// itself. FISH+ against a Windows peer takes this branch so the
+	// PTY (cmd.exe by default) sees a "cd /d \"C:\\...\" & rem f4_sync"
+	// instead of the bash-shaped one, which cmd treats as a broken
+	// argument and complains about at every step.
+	if integ, ok := v.(vfs.PtyShellIntegration); ok {
+		if seq := integ.PtyChangeDirCommand(path); len(seq) > 0 {
+			activePty.Write(seq)
 		}
 		return true
 	}
-	return false
+
+	if isWindowsShell {
+		activePty.Write([]byte(fmt.Sprintf("cd /d \"%s\" & rem f4_sync\r", path)))
+	} else {
+		sqPath := strings.ReplaceAll(path, "'", "'\\''")
+		activePty.Write([]byte(fmt.Sprintf(" cd '%s' # f4_sync\r", sqPath)))
+	}
+	return true
 }
 
 func vfsHasRemotePTY(v vfs.VFS) bool {
