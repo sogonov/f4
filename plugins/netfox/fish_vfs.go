@@ -917,6 +917,79 @@ func (v *FishVFS) FindFiles(ctx context.Context, dir string, q vfs.FindQuery) ([
 	return out, nil
 }
 
+// PtyChangeDirCommand implements vfs.PtyShellIntegration. The panel's
+// PTY channel runs the peer's DefaultShell — cmd.exe on a stock
+// OpenSSH-Server-Windows host, whatever the login shell is on a POSIX
+// host. Send syntax the actual PTY shell understands, converting the
+// path from the wire's Cygwin shape (/c/Users/foo) to what the shell
+// wants (C:\Users\foo for cmd, /c/Users/foo unchanged for POSIX).
+//
+// f4_sync is a stray marker helper.sh's own log filter can strip: cmd
+// keeps it as a rem comment, POSIX keeps it as a shell comment.
+func (v *FishVFS) PtyChangeDirCommand(dir string) []byte {
+	if v.peerIsWindows() {
+		winDir := fishplus.WirePathToWindows(dir)
+		if winDir == "" {
+			return nil
+		}
+		return []byte(fmt.Sprintf("cd /d \"%s\" & rem f4_sync\r", winDir))
+	}
+	sq := strings.ReplaceAll(dir, "'", "'\\''")
+	return []byte(fmt.Sprintf(" cd '%s' # f4_sync\r", sq))
+}
+
+// PtyRunCommand implements vfs.PtyShellIntegration. Same shell-flavor
+// split as PtyChangeDirCommand: cmd wants "cd /d \"path\" & command",
+// POSIX wants "cd 'path' && command". An empty dir skips the cd.
+func (v *FishVFS) PtyRunCommand(dir, command string) []byte {
+	if command == "" {
+		return nil
+	}
+	if v.peerIsWindows() {
+		if dir == "" {
+			return []byte(fmt.Sprintf("%s\r", command))
+		}
+		winDir := fishplus.WirePathToWindows(dir)
+		if winDir == "" {
+			return []byte(fmt.Sprintf("%s\r", command))
+		}
+		return []byte(fmt.Sprintf("cd /d \"%s\" & %s\r", winDir, command))
+	}
+	if dir == "" {
+		return []byte(fmt.Sprintf(" %s\r", command))
+	}
+	sq := strings.ReplaceAll(dir, "'", "'\\''")
+	return []byte(fmt.Sprintf(" cd '%s' && %s\r", sq, command))
+}
+
+// PtyInterrupt implements vfs.PtyShellIntegration. cmd.exe over ConPTY
+// and every POSIX shell treat a raw ETX (0x03) as SIGINT / Ctrl+C; no
+// flavor-specific wrapping is needed.
+func (v *FishVFS) PtyInterrupt() []byte {
+	return []byte{0x03}
+}
+
+// peerIsWindows reports whether the FISH+ helper on the peer announced
+// itself as PowerShell (flavor:pwsh feature). A Windows peer's PTY
+// channel is what needs cmd-shaped commands; a POSIX peer keeps the
+// original bash-style templates.
+func (v *FishVFS) peerIsWindows() bool {
+	c := v.client()
+	if c == nil {
+		return false
+	}
+	s := c.Session()
+	if s == nil {
+		return false
+	}
+	for _, n := range s.Features().Names() {
+		if n == "flavor:pwsh" {
+			return true
+		}
+	}
+	return false
+}
+
 // opStatsFromScan converts what the remote walk counted. PhysicalBytes stays
 // zero: the remote host reports apparent sizes, and a consumer that sees a
 // zero there hides the metric rather than showing a wrong one.
