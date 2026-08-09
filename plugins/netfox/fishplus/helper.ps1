@@ -1820,13 +1820,32 @@ function Cmd-JStart {
                 [System.IO.File]::WriteAllText($rcP, '1', $utf8NoBom)
             }
         }
-        if (Test-ThreadJobAvailable) {
-            $j = Start-ThreadJob -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP, $xa1, $xa2, $xa3
-        } else {
-            $j = Start-Job -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP, $xa1, $xa2, $xa3
-        }
-        $script:F4Jobs[$slot.Id] = $j
-        [System.IO.File]::WriteAllText((Join-Path $jd 'pid'), $j.Id.ToString(), $utf8NoBom)
+        # In-process runspace via [PowerShell]::Create(). Start-Job under
+        # PS 5.1 spawns a fresh pwsh.exe process, which measured ~100x
+        # slower for the byte-scan content search than the same code in
+        # the main helper process — Windows appears to apply background
+        # I/O priority to job processes, and the cross-process pipes and
+        # remoting serialization add on top. A runspace lives in this
+        # very process, so file I/O runs at the same priority as the
+        # rest of the helper and there is no serialization for the job's
+        # implicit output streams. Startup is ~100 ms rather than
+        # several seconds. Start-ThreadJob would give the same wins but
+        # is a separate module and is not present on stock PS 5.1, which
+        # is what the cmd fallback route lands on.
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        [void]$ps.AddScript($body)
+        [void]$ps.AddArgument($kind)
+        [void]$ps.AddArgument($paths)
+        [void]$ps.AddArgument($jd)
+        [void]$ps.AddArgument($outP)
+        [void]$ps.AddArgument($errP)
+        [void]$ps.AddArgument($rcP)
+        [void]$ps.AddArgument($xa1)
+        [void]$ps.AddArgument($xa2)
+        [void]$ps.AddArgument($xa3)
+        [void]$ps.BeginInvoke()
+        $script:F4Jobs[$slot.Id] = $ps
+        [System.IO.File]::WriteAllText((Join-Path $jd 'pid'), $PID.ToString(), $utf8NoBom)
         Write-Line ("J " + $slot.Id)
         Write-Ok
     } catch { Write-Err $_.Exception.Message }
@@ -1933,14 +1952,20 @@ function Cmd-JPoll {
     } catch { Write-Err $_.Exception.Message }
 }
 
-# Stops whatever background executor a job entry holds. exec jobs are
-# raw System.Diagnostics.Process objects; scan/hash are PS Job objects.
-# Killing either one is done differently, and one killing the other
-# throws — hence the type switch.
+# Stops whatever background executor a job entry holds. Three shapes are
+# possible: exec jobs are raw System.Diagnostics.Process objects (cmd.exe
+# running the user's command), scan/hash/ffind jobs are
+# System.Management.Automation.PowerShell instances (in-process runspace),
+# and older versions used PS Job objects (kept as a fallback in case an
+# entry from before an upgrade is still around).
 function Stop-JobEntry($entry) {
     if ($null -eq $entry) { return }
     if ($entry -is [System.Diagnostics.Process]) {
         try { if (-not $entry.HasExited) { $entry.Kill() } } catch { }
+        return
+    }
+    if ($entry -is [System.Management.Automation.PowerShell]) {
+        try { $entry.Stop() } catch { }
         return
     }
     try { Stop-Job -Job $entry -ErrorAction SilentlyContinue } catch { }
@@ -1949,6 +1974,10 @@ function Stop-JobEntry($entry) {
 function Remove-JobEntry($entry) {
     if ($null -eq $entry) { return }
     if ($entry -is [System.Diagnostics.Process]) {
+        try { $entry.Dispose() } catch { }
+        return
+    }
+    if ($entry -is [System.Management.Automation.PowerShell]) {
         try { $entry.Dispose() } catch { }
         return
     }

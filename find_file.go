@@ -18,6 +18,21 @@ type FoundFile struct {
 	Item vfs.VFSItem
 }
 
+// padLabelTo returns s padded with trailing spaces to at least w display
+// cells. Used to force a vtui label to open at its full future width —
+// the widget freezes its width at construction time, so a label built
+// from short initial text truncates every longer SetText silently. (An
+// existing padLabel in attributes_dialog is fixed at 12 columns; this
+// takes an explicit target so the find dialog's path label can open at
+// the full dialog width.)
+func padLabelTo(s string, w int) string {
+	pad := w - runewidth.StringWidth(s)
+	if pad <= 0 {
+		return s
+	}
+	return s + strings.Repeat(" ", pad)
+}
+
 // maxRemoteFindResults caps what a remote search brings back in one answer.
 // The local walk has no such limit because it costs nothing to keep going;
 // a remote one pays for every hit on the wire.
@@ -28,9 +43,20 @@ func ExecuteFindFile(pf *PanelsFrame, v vfs.VFS, startDir, mask, text string) {
 	dlg := vtui.NewCenteredDialog(60, 9, Msg("FindFile.SearchingTitle"))
 	dlg.AttentionSuppressed = true
 
-	lblMask := vtui.NewLabel(0, 0, Msg("FindFile.MaskPrompt")+" "+mask, nil)
-	lblDir := vtui.NewLabel(0, 0, Msg("FindFile.Scanning")+" ...", nil)
-	lblFound := vtui.NewLabel(0, 0, fmt.Sprintf(Msg("FindFile.FoundCount"), 0), nil)
+	// vtui.NewLabel fixes the label's display width to the width of the
+	// initial text (see text.go: X2 = X1 + runewidth.StringWidth(...) - 1),
+	// and SetText later cannot grow it back — every subsequent path or
+	// count that is longer than the initial string is silently truncated
+	// to the first-N chars. The reported symptom was a running search
+	// showing "Scanning: /li" — three characters of a wire-shape path
+	// that would otherwise say /c/Users/... . Pad the initial text to
+	// the size the field will ever need.
+	lblMask := vtui.NewLabel(0, 0, padLabelTo(Msg("FindFile.MaskPrompt")+" "+mask, 56), nil)
+	lblDir := vtui.NewLabel(0, 0, padLabelTo(Msg("FindFile.Scanning")+" ...", 56), nil)
+	// lblFound sits in an hbox next to the Cancel button; 24 characters
+	// covers "Found: 999999999" and then some, and leaves the rest of
+	// the row for the button which AlignRight anchors at the far end.
+	lblFound := vtui.NewLabel(0, 0, padLabelTo(fmt.Sprintf(Msg("FindFile.FoundCount"), 0), 24), nil)
 
 	btnCancel := vtui.NewButton(0, 0, Msg("vtui.Cancel"))
 
