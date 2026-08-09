@@ -1230,6 +1230,71 @@ function Cmd-JStart {
         [System.IO.File]::WriteAllText((Join-Path $jd 'kind'), $kind + "`n", $utf8NoBom)
         [System.IO.File]::WriteAllText($nP, '0', $utf8NoBom)
         [System.IO.File]::WriteAllBytes($outP, [byte[]]@())
+
+        # exec bypasses Start-Job entirely. On PS 5.1 launched through
+        # the "cmd /c powershell.exe" flavor route, Start-Job has to
+        # spawn a fresh pwsh child, and doing that from inside a
+        # nested-cmd/nested-powershell chain can hang outright (observed:
+        # "clear" and "git -v" from an f4 panel terminal never return).
+        # A shell command is an external process anyway — no PS runspace
+        # wrapper is needed to run it in the background, we just start
+        # cmd.exe directly and let it write its own rc file when done.
+        if ($kind -eq 'exec') {
+            $dirWire = $paths[0]
+            $cmdText = $paths[1]
+            $cwd = $null
+            if (-not [string]::IsNullOrEmpty($dirWire)) {
+                $cwd = Convert-PosixToWin $dirWire
+                if (-not (Test-Path -LiteralPath $cwd -PathType Container)) {
+                    [System.IO.File]::AppendAllText($errP, "no such directory`n", $utf8NoBom)
+                    [System.IO.File]::WriteAllText($rcP, '1', $utf8NoBom)
+                    Write-Line ("J " + $slot.Id); Write-Ok; return
+                }
+            }
+            if ([string]::IsNullOrEmpty($cmdText)) {
+                [System.IO.File]::AppendAllText($errP, "empty command`n", $utf8NoBom)
+                [System.IO.File]::WriteAllText($rcP, '1', $utf8NoBom)
+                Write-Line ("J " + $slot.Id); Write-Ok; return
+            }
+            # The user command lives in exec.cmd; wrap.cmd runs it with
+            # cmd's own redirection (stdin from NUL, stdout+stderr into
+            # the job's out file), then writes the exit code to rc. That
+            # single cmd.exe is the entire job — Cmd-JPoll only has to
+            # look at the rc file to know it finished.
+            $exec = Join-Path $jd 'exec.cmd'
+            $wrap = Join-Path $jd 'wrap.cmd'
+            $execBody = "@echo off`r`n" + $cmdText + "`r`nexit /b %ERRORLEVEL%`r`n"
+            [System.IO.File]::WriteAllText($exec, $execBody, [System.Text.Encoding]::Default)
+            $wrapBody = "@echo off`r`n" +
+                        "call `"$exec`" < NUL > `"$outP`" 2>&1`r`n" +
+                        "set F4RC=%ERRORLEVEL%`r`n" +
+                        "> `"$rcP`" echo %F4RC%`r`n" +
+                        "exit /b %F4RC%`r`n"
+            [System.IO.File]::WriteAllText($wrap, $wrapBody, [System.Text.Encoding]::Default)
+            $comspec = $env:ComSpec
+            if ([string]::IsNullOrEmpty($comspec)) { $comspec = 'cmd.exe' }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $comspec
+            # /d skips AutoRun; /c runs the wrap batch and exits. The
+            # outer quotes let cmd take the file path even when TEMP has
+            # spaces.
+            $psi.Arguments = "/d /c `"$wrap`""
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow  = $true
+            if ($null -ne $cwd) { $psi.WorkingDirectory = $cwd }
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $script:F4Jobs[$slot.Id] = $p
+            [System.IO.File]::WriteAllText((Join-Path $jd 'pid'), $p.Id.ToString(), $utf8NoBom)
+            Write-Line ("J " + $slot.Id)
+            Write-Ok
+            return
+        }
+
+        # scan and hash still go through Start-Job (or Start-ThreadJob
+        # if the module is installed). They are pure PS bodies that do
+        # not spawn subprocesses, so the nested-launch hang exec had
+        # does not apply — if it ever does, they get the same treatment.
+        #
         # The body runs in its own runspace (Start-Job) or thread
         # (Start-ThreadJob). Neither one inherits the parent's function
         # table, so every helper the body needs is defined inside it.
@@ -1545,15 +1610,34 @@ function Cmd-JPoll {
     } catch { Write-Err $_.Exception.Message }
 }
 
+# Stops whatever background executor a job entry holds. exec jobs are
+# raw System.Diagnostics.Process objects; scan/hash are PS Job objects.
+# Killing either one is done differently, and one killing the other
+# throws — hence the type switch.
+function Stop-JobEntry($entry) {
+    if ($null -eq $entry) { return }
+    if ($entry -is [System.Diagnostics.Process]) {
+        try { if (-not $entry.HasExited) { $entry.Kill() } } catch { }
+        return
+    }
+    try { Stop-Job -Job $entry -ErrorAction SilentlyContinue } catch { }
+}
+
+function Remove-JobEntry($entry) {
+    if ($null -eq $entry) { return }
+    if ($entry -is [System.Diagnostics.Process]) {
+        try { $entry.Dispose() } catch { }
+        return
+    }
+    try { Remove-Job -Job $entry -Force -ErrorAction SilentlyContinue } catch { }
+}
+
 function Cmd-JKill {
     param([string]$idArg)
     try {
         $jd = Get-JobDir $idArg
         if ($null -eq $jd) { Write-Err 'no such job'; return }
-        $j = $script:F4Jobs[[int]$idArg]
-        if ($null -ne $j) {
-            try { Stop-Job -Job $j -ErrorAction SilentlyContinue } catch { }
-        }
+        Stop-JobEntry $script:F4Jobs[[int]$idArg]
         [System.IO.File]::WriteAllText((Join-Path $jd 'kill'), '1', $utf8NoBom)
         Write-Ok
     } catch { Write-Err $_.Exception.Message }
@@ -1564,10 +1648,10 @@ function Cmd-JDrop {
     try {
         $jd = Get-JobDir $idArg
         if ($null -eq $jd) { Write-Ok; return }
-        $j = $script:F4Jobs[[int]$idArg]
-        if ($null -ne $j) {
-            try { Stop-Job -Job $j -ErrorAction SilentlyContinue } catch { }
-            try { Remove-Job -Job $j -Force -ErrorAction SilentlyContinue } catch { }
+        $entry = $script:F4Jobs[[int]$idArg]
+        if ($null -ne $entry) {
+            Stop-JobEntry $entry
+            Remove-JobEntry $entry
             $script:F4Jobs.Remove([int]$idArg)
         }
         try { Remove-Item -LiteralPath $jd -Recurse -Force -ErrorAction SilentlyContinue } catch { }
@@ -1615,9 +1699,9 @@ function Cmd-WMode {
 # ---------------------------------------------------------------------
 function Invoke-JCleanup {
     if ($null -eq $script:F4JDir) { return }
-    foreach ($j in $script:F4Jobs.Values) {
-        try { Stop-Job -Job $j -ErrorAction SilentlyContinue } catch { }
-        try { Remove-Job -Job $j -Force -ErrorAction SilentlyContinue } catch { }
+    foreach ($entry in $script:F4Jobs.Values) {
+        Stop-JobEntry $entry
+        Remove-JobEntry $entry
     }
     try { Remove-Item -LiteralPath $script:F4JDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     $script:F4JDir = $null
