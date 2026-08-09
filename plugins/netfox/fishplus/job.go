@@ -12,7 +12,10 @@ import (
 // MaxJobPaths bounds how many path lines one job request carries. The helper
 // refuses more, and the limit is repeated here so a caller finds out before
 // half a request is on the wire.
-const MaxJobPaths = 4
+//
+// 32 leaves ample room for a ffind job: one directory + up to 30 masks + one
+// content pattern. scan/hash/exec all use two or fewer paths.
+const MaxJobPaths = 32
 
 // DefaultPollLines is how many output lines one poll brings back. A poll is
 // a round trip, so it should be worth making; a job producing more than this

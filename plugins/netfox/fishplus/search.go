@@ -110,6 +110,23 @@ type FindOptions struct {
 	IgnoreCase bool
 	// Limit caps the number of hits; zero means MaxFindResults.
 	Limit int
+	// Progress, when non-nil, is called periodically while the search
+	// runs — currently only when the remote helper drives the search as
+	// a background job (Windows peers with the "ffindjob" feature). It
+	// reports how many entries the walk has visited and where the head
+	// currently is, so a dialog can show "scanning X, N found so far."
+	// Fired on the goroutine that runs Find; the callback must not block.
+	Progress func(FindProgress)
+}
+
+// FindProgress is a checkpoint reported by an in-flight tree search.
+type FindProgress struct {
+	// Scanned is the number of entries the walk has visited so far.
+	Scanned int64
+	// Found is the number of entries that have matched so far.
+	Found int64
+	// Path is the last path the walk looked at, in wire format.
+	Path string
 }
 
 // CanFind reports whether the remote host can walk a tree for us. Anything
@@ -121,6 +138,13 @@ func (c *Client) CanFind() bool { return c.sess.Features().ListingMode() != "" }
 // inside the same find, so a candidate is never downloaded just to be
 // rejected — which is the difference between searching a remote source tree
 // and waiting for it to arrive.
+//
+// Two paths, picked from the peer's feature banner: a helper that announced
+// "ffindjob" drives the search as a background job — cancel via jdrop when
+// the caller's context is done, live progress via P lines, and the panel
+// session stays free for other requests meanwhile. A helper without that
+// feature falls through to the synchronous ffind wire command, which is
+// what the POSIX helper still speaks.
 func (c *Client) Find(ctx context.Context, dir string, opts FindOptions) ([]Entry, error) {
 	masks := make([]string, 0, len(opts.Masks))
 	for _, m := range opts.Masks {
@@ -141,14 +165,19 @@ func (c *Client) Find(ctx context.Context, dir string, opts FindOptions) ([]Entr
 	if limit <= 0 || limit > MaxFindResults {
 		limit = MaxFindResults
 	}
-
 	gmode := "-"
-	paths := append([]string{dir}, masks...)
 	if opts.Text != "" {
 		gmode = GrepOptions{Fixed: opts.Fixed, IgnoreCase: opts.IgnoreCase}.mode()
-		paths = append(paths, opts.Text)
 	}
 
+	if c.sess.Features().Has("ffindjob") && c.CanRunJobs() {
+		return c.findViaJob(ctx, dir, masks, opts.Text, gmode, limit, opts.Progress)
+	}
+
+	paths := append([]string{dir}, masks...)
+	if opts.Text != "" {
+		paths = append(paths, opts.Text)
+	}
 	resp, err := c.sess.ExecPaths(ctx, "ffind", paths,
 		strconv.Itoa(limit), strconv.Itoa(len(masks)), gmode)
 	if err != nil {
@@ -162,6 +191,152 @@ func (c *Client) Find(ctx context.Context, dir string, opts FindOptions) ([]Entr
 		return nil, err
 	}
 	return entries, nil
+}
+
+// findViaJob drives the tree walk as a background job. It gets cancel and
+// progress that the sync path cannot offer, at the cost of the same
+// poll-with-backoff dance FollowScan uses. On ctx cancel the job is
+// dropped on a fresh context, matching how Scan cleans up.
+func (c *Client) findViaJob(ctx context.Context, dir string, masks []string, text, gmode string, limit int, progress func(FindProgress)) ([]Entry, error) {
+	paths := make([]string, 0, 1+len(masks)+1)
+	paths = append(paths, dir)
+	paths = append(paths, masks...)
+	if text != "" {
+		paths = append(paths, text)
+	}
+	id, err := c.StartJob(ctx, "ffind", paths,
+		strconv.Itoa(limit), strconv.Itoa(len(masks)), gmode)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := c.followFind(ctx, id, dir, progress)
+	c.dropJobQuietly(id)
+	return entries, err
+}
+
+// followFind polls a ffind job until it ends, parses hit lines into
+// Entry records, and forwards P lines to progress if set. Poll cadence
+// backs off between empty polls exactly like FollowScan, so a big walk
+// does not spend more round trips than a small one.
+func (c *Client) followFind(ctx context.Context, id int, dir string, progress func(FindProgress)) ([]Entry, error) {
+	reqCtx := context.WithoutCancel(ctx)
+	var entries []Entry
+	mode := ""
+	wait := jobPollMin
+	for {
+		st, err := c.PollJob(reqCtx, id, DefaultPollLines)
+		if err != nil {
+			return entries, err
+		}
+		fresh := false
+		for _, line := range st.Lines {
+			if line == "" {
+				continue
+			}
+			if strings.HasPrefix(line, "M ") {
+				mode = strings.TrimSpace(strings.TrimPrefix(line, "M "))
+				continue
+			}
+			if strings.HasPrefix(line, "P ") {
+				if progress != nil {
+					if p, ok := parseFindProgress(line); ok {
+						progress(p)
+					}
+				}
+				fresh = true
+				continue
+			}
+			if strings.HasPrefix(line, "T ") {
+				// Total marker — nothing to do beyond noting we saw it;
+				// the entries live in the lines that came before.
+				continue
+			}
+			// Try to parse as a stat-shaped entry with the full path in
+			// its name field. We can only do that once we have seen the
+			// mode marker; anything before is a diagnostic from a remote
+			// tool and gets ignored.
+			if mode == "" {
+				continue
+			}
+			e, perr := parseFoundEntry(line, mode)
+			if perr != nil {
+				// A stray diagnostic must not cost the caller the
+				// entries that did parse.
+				continue
+			}
+			entries = append(entries, e)
+			fresh = true
+		}
+		if err := ctx.Err(); err != nil {
+			return entries, err
+		}
+		if st.More {
+			continue
+		}
+		switch st.State {
+		case JobKilled:
+			return entries, ErrJobKilled
+		case JobDone:
+			if st.Exit != 0 {
+				msg := st.Msg
+				if msg == "" {
+					msg = "the remote find failed with status " + strconv.Itoa(st.Exit)
+				}
+				return entries, &RemoteError{Cmd: "ffind " + dir, Msg: msg}
+			}
+			return entries, nil
+		}
+		if fresh {
+			wait = jobPollMin
+		}
+		if err := sleepCtx(ctx, wait); err != nil {
+			return entries, err
+		}
+		wait *= 2
+		if wait > jobPollMax {
+			wait = jobPollMax
+		}
+	}
+}
+
+// parseFindProgress reads a "P <scanned> <found> <path>" line. A malformed
+// one is ignored rather than fatal: it is a hint, not a payload.
+func parseFindProgress(line string) (FindProgress, bool) {
+	f := strings.SplitN(strings.TrimPrefix(line, "P "), " ", 3)
+	if len(f) < 2 {
+		return FindProgress{}, false
+	}
+	scanned, err := strconv.ParseInt(f[0], 10, 64)
+	if err != nil {
+		return FindProgress{}, false
+	}
+	found, err := strconv.ParseInt(f[1], 10, 64)
+	if err != nil {
+		return FindProgress{}, false
+	}
+	p := FindProgress{Scanned: scanned, Found: found}
+	if len(f) == 3 {
+		p.Path = f[2]
+	}
+	return p, true
+}
+
+// parseFoundEntry reads one entry line from a ffind job's output. Same
+// backend selection as ParseFoundListing; kept separate because the job
+// stream interleaves M/P/T/entry lines and the caller needs to pick.
+func parseFoundEntry(line, mode string) (Entry, error) {
+	switch mode {
+	case "find":
+		return parseFindEntry(line)
+	case "stat":
+		return parseStatLike(line, 16, "stat listing", true)
+	case "statbsd":
+		return parseStatLike(line, 8, "bsd stat listing", true)
+	case "ls":
+		return parseLsEntry(line, "", true)
+	default:
+		return Entry{}, fmt.Errorf("fishplus: unknown ffind listing mode %q", mode)
+	}
 }
 
 // LineIndex is what the remote host knows about the line structure of a file
