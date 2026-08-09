@@ -1104,6 +1104,15 @@ function Cmd-LineIdx {
 # ffind <limit> <nmasks> <grep mode>: walk a whole tree, emit
 # stat-shaped entries for hits, up to <limit>. If grep mode != '-',
 # also read a pattern line and filter files whose content matches.
+#
+# Reparse points are NOT followed for recursion — Windows profiles
+# contain self-referential junctions (AppData\Local\Application Data ->
+# AppData\Local is the classic offender), and every recursive .NET or
+# PowerShell walk follows them by default (Get-ChildItem -Recurse and
+# Directory.EnumerateFiles with SearchOption.AllDirectories both do).
+# Without this guard Alt+F7 anywhere inside a profile loops forever.
+# helper.sh has the same rule for its job body ("a link pointing at
+# its own parent cannot make the walk grow forever").
 # ---------------------------------------------------------------------
 function Cmd-FFind {
     param([string]$limArg, [string]$nmArg, [string]$gmode)
@@ -1134,38 +1143,60 @@ function Cmd-FFind {
             if ($ci) { $opts = $opts -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
             $rx = New-Object System.Text.RegularExpressions.Regex($pat, $opts)
         }
-        $enum = Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction SilentlyContinue
         $count = 0
-        foreach ($fi in $enum) {
-            $name = $fi.Name
-            $ok = $false
-            foreach ($m in $masks) {
-                if ([System.IO.Path]::GetFileName($name) -like $m) { $ok = $true; break }
-            }
-            if (-not $ok) { continue }
-            if ($pat -ne $null) {
-                $hit = $false
-                try {
-                    if ($fixed) {
-                        $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase }
-                               else     { [System.StringComparison]::Ordinal }
-                        foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
-                            if ($ln.IndexOf($pat, $cmp) -ge 0) { $hit = $true; break }
-                        }
-                    } else {
-                        foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
-                            if ($rx.IsMatch($ln)) { $hit = $true; break }
-                        }
+        $stack = New-Object System.Collections.Generic.Stack[string]
+        $stack.Push($dir)
+        $reparse = [System.IO.FileAttributes]::ReparsePoint
+        $cmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+        :outer while ($stack.Count -gt 0 -and $count -lt $limit) {
+            $cur = $stack.Pop()
+            $files = $null
+            try { $files = [System.IO.Directory]::EnumerateFiles($cur) } catch { }
+            if ($null -ne $files) {
+                foreach ($fp in $files) {
+                    if ($count -ge $limit) { break outer }
+                    $fi = $null
+                    try { $fi = New-Object System.IO.FileInfo $fp } catch { continue }
+                    if ($fi.Attributes -band $reparse) { continue }
+                    $name = $fi.Name
+                    $ok = $false
+                    foreach ($m in $masks) {
+                        if ($name -like $m) { $ok = $true; break }
                     }
-                } catch { $hit = $false }
-                if (-not $hit) { continue }
+                    if (-not $ok) { continue }
+                    if ($pat -ne $null) {
+                        $hit = $false
+                        try {
+                            if ($fixed) {
+                                foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
+                                    if ($ln.IndexOf($pat, $cmp) -ge 0) { $hit = $true; break }
+                                }
+                            } else {
+                                foreach ($ln in [System.IO.File]::ReadLines($fi.FullName, $utf8NoBom)) {
+                                    if ($rx.IsMatch($ln)) { $hit = $true; break }
+                                }
+                            }
+                        } catch { $hit = $false }
+                        if (-not $hit) { continue }
+                    }
+                    # For a tree search the client wants the FULL wire
+                    # path in the name field of the entry.
+                    $wirePath = Convert-WinToPosix $fi.FullName
+                    try { Emit-StatEntry -fi $fi -nameOverride $wirePath } catch { }
+                    $count++
+                }
             }
-            # For a tree search the client wants the FULL wire path in
-            # the name field of the entry.
-            $wirePath = Convert-WinToPosix $fi.FullName
-            try { Emit-StatEntry -fi $fi -nameOverride $wirePath } catch { }
-            $count++
-            if ($count -ge $limit) { break }
+            $subs = $null
+            try { $subs = [System.IO.Directory]::EnumerateDirectories($cur) } catch { }
+            if ($null -ne $subs) {
+                foreach ($sd in $subs) {
+                    try {
+                        $di = New-Object System.IO.DirectoryInfo $sd
+                        if ($di.Attributes -band $reparse) { continue }
+                        $stack.Push($sd)
+                    } catch { }
+                }
+            }
         }
         Write-Ok
     } catch { Write-Err $_.Exception.Message }
@@ -1324,6 +1355,45 @@ function Cmd-JStart {
                 }
                 return '/' + $w.Replace('\', '/').TrimStart('/').TrimEnd('/')
             }
+            # Depth-first walk that skips reparse points during recursion,
+            # so a junction cycle (Windows profile: AppData\Local\Application
+            # Data -> AppData\Local, and friends) does not loop the scan
+            # forever. helper.sh has the same rule in f4_job_scan's comment.
+            # Yields two things: for each file it invokes $onFile with
+            # the FileInfo, and for each directory it invokes $onDir with
+            # its full path (a scan counts both, hash only files).
+            function Walk-Tree {
+                param([string]$root, [scriptblock]$onFile, [scriptblock]$onDir)
+                $reparse = [System.IO.FileAttributes]::ReparsePoint
+                $stack = New-Object System.Collections.Generic.Stack[string]
+                $stack.Push($root)
+                if ($null -ne $onDir) { & $onDir $root }
+                while ($stack.Count -gt 0) {
+                    $cur = $stack.Pop()
+                    $files = $null
+                    try { $files = [System.IO.Directory]::EnumerateFiles($cur) } catch { }
+                    if ($null -ne $files -and $null -ne $onFile) {
+                        foreach ($fp in $files) {
+                            $fi = $null
+                            try { $fi = New-Object System.IO.FileInfo $fp } catch { continue }
+                            if ($fi.Attributes -band $reparse) { continue }
+                            & $onFile $fi
+                        }
+                    }
+                    $subs = $null
+                    try { $subs = [System.IO.Directory]::EnumerateDirectories($cur) } catch { }
+                    if ($null -ne $subs) {
+                        foreach ($sd in $subs) {
+                            try {
+                                $di = New-Object System.IO.DirectoryInfo $sd
+                                if ($di.Attributes -band $reparse) { continue }
+                                if ($null -ne $onDir) { & $onDir $sd }
+                                $stack.Push($sd)
+                            } catch { }
+                        }
+                    }
+                }
+            }
             function Run-JobScan {
                 param($rootWin, $outPath, $errPath, $rcPath, $enc)
                 $rc = 0
@@ -1331,27 +1401,32 @@ function Cmd-JStart {
                     if (-not (Test-Path -LiteralPath $rootWin -PathType Container)) { throw 'not a directory' }
                     $out = New-Object System.IO.StreamWriter($outPath, $false, $enc)
                     try {
-                        $fbytes = 0L; $dbytes = 0L; $files = 0L; $dirs = 0L; $k = 0L
-                        $lastPath = ''
-                        foreach ($p in [System.IO.Directory]::EnumerateFileSystemEntries(
-                                        $rootWin, '*', [System.IO.SearchOption]::AllDirectories)) {
-                            $k++
-                            try {
-                                $attr = [System.IO.File]::GetAttributes($p)
-                                if ($attr -band [System.IO.FileAttributes]::Directory) {
-                                    $dirs++
-                                } else {
-                                    $files++
-                                    $fbytes += (New-Object System.IO.FileInfo $p).Length
-                                }
-                            } catch { }
-                            if (($k % 2000) -eq 0) {
-                                $lastPath = Convert-WinToPosix $p
-                                $out.WriteLine("P $fbytes $dbytes $files $dirs $lastPath")
+                        $stateRef = [pscustomobject]@{
+                            Fbytes=0L; Dbytes=0L; Files=0L; Dirs=0L; K=0L
+                        }
+                        $onFile = {
+                            param($fi)
+                            $stateRef.Files++
+                            $stateRef.Fbytes += $fi.Length
+                            $stateRef.K++
+                            if (($stateRef.K % 2000) -eq 0) {
+                                $lp = Convert-WinToPosix $fi.FullName
+                                $out.WriteLine("P $($stateRef.Fbytes) $($stateRef.Dbytes) $($stateRef.Files) $($stateRef.Dirs) $lp")
                                 $out.Flush()
                             }
                         }
-                        $out.WriteLine("T $fbytes $dbytes $files $dirs")
+                        $onDir = {
+                            param($p)
+                            $stateRef.Dirs++
+                            $stateRef.K++
+                            if (($stateRef.K % 2000) -eq 0) {
+                                $lp = Convert-WinToPosix $p
+                                $out.WriteLine("P $($stateRef.Fbytes) $($stateRef.Dbytes) $($stateRef.Files) $($stateRef.Dirs) $lp")
+                                $out.Flush()
+                            }
+                        }
+                        Walk-Tree $rootWin $onFile $onDir
+                        $out.WriteLine("T $($stateRef.Fbytes) $($stateRef.Dbytes) $($stateRef.Files) $($stateRef.Dirs)")
                         $out.Flush()
                     } finally { $out.Dispose() }
                 } catch {
@@ -1368,10 +1443,12 @@ function Cmd-JStart {
                     $sizesPath = Join-Path $jobDir 'sizes'
                     $sw = New-Object System.IO.StreamWriter($sizesPath, $false, $enc)
                     try {
-                        foreach ($p in [System.IO.Directory]::EnumerateFiles(
-                                        $rootWin, '*', [System.IO.SearchOption]::AllDirectories)) {
-                            try { $sw.WriteLine("$((New-Object System.IO.FileInfo $p).Length) $p") } catch { }
+                        $writer = $sw
+                        $onFile = {
+                            param($fi)
+                            try { $writer.WriteLine("$($fi.Length) $($fi.FullName)") } catch { }
                         }
+                        Walk-Tree $rootWin $onFile $null
                     } finally { $sw.Dispose() }
                     $counts = @{}
                     foreach ($ln in [System.IO.File]::ReadLines($sizesPath, $enc)) {
