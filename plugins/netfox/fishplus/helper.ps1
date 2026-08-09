@@ -1301,17 +1301,38 @@ function New-JobSlot {
 # The scan job body: walks a tree, counts files/dirs and their bytes,
 # emits "P" progress lines every 2000 entries and one "T" total at end.
 function Cmd-JStart {
-    param([string]$kind, [string]$nPathsArg)
+    param(
+        [string]$kind,
+        [string]$nPathsArg,
+        [string]$xa1 = '',   # extra args used by 'ffind': limit, nmasks, gmode
+        [string]$xa2 = '',
+        [string]$xa3 = ''
+    )
     try {
         if (-not (Test-IsUInt $nPathsArg)) { Write-Err 'bad path count'; return }
         $n = [int]$nPathsArg
-        if ($n -gt 4) { Write-Err 'bad path count'; return }
+        # 32 is a generous cap: scan/hash use 1, exec uses 2, ffind uses
+        # 1 + mask count + optional pattern (typical Alt+F7 dialog sends
+        # under a handful).
+        if ($n -gt 32) { Write-Err 'bad path count'; return }
         $paths = New-Object 'string[]' $n
         for ($i = 0; $i -lt $n; $i++) { $paths[$i] = Read-PathLine }
         switch ($kind) {
-            'scan' { if ($n -ne 1) { Write-Err 'this job takes one path'; return } }
-            'hash' { if ($n -ne 1) { Write-Err 'this job takes one path'; return } }
-            'exec' { if ($n -ne 2) { Write-Err 'the exec job takes a directory and a command'; return } }
+            'scan'  { if ($n -ne 1) { Write-Err 'this job takes one path'; return } }
+            'hash'  { if ($n -ne 1) { Write-Err 'this job takes one path'; return } }
+            'exec'  { if ($n -ne 2) { Write-Err 'the exec job takes a directory and a command'; return } }
+            'ffind' {
+                if ($n -lt 2) { Write-Err 'ffind needs a directory and at least one mask'; return }
+                if (-not (Test-IsUInt $xa1) -or -not (Test-IsUInt $xa2) -or [string]::IsNullOrEmpty($xa3)) {
+                    Write-Err 'ffind needs <limit> <nmasks> <gmode>'; return
+                }
+                $nmasks = [int]$xa2
+                # dir + nmasks + optional pattern
+                $expected = 1 + $nmasks
+                if ($xa3 -ne '-') { $expected += 1 }
+                if ($n -ne $expected) { Write-Err 'ffind path count does not match nmasks'; return }
+                if ($xa3 -ne '-' -and $xa3 -match '[^fie]') { Write-Err 'bad grep mode'; return }
+            }
             default { Write-Err 'unknown job kind'; return }
         }
         $slot = New-JobSlot
@@ -1395,7 +1416,7 @@ function Cmd-JStart {
         # references so a maintainer can read them independently; the
         # runtime copies live in $body.
         $body = {
-            param($kind, $paths, $jd, $outP, $errP, $rcP)
+            param($kind, $paths, $jd, $outP, $errP, $rcP, $xa1 = '', $xa2 = '', $xa3 = '')
             $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
             function Convert-PosixToWin([string]$p) {
                 if ($p -eq '' -or $p -eq '/') { return '' }
@@ -1625,11 +1646,160 @@ function Cmd-JStart {
                     [System.IO.File]::WriteAllText($rcPath, '1', $enc)
                 }
             }
+            function Run-JobFFind {
+                param($paths, $limitArg, $nmasksArg, $gmode, $jd, $outPath, $errPath, $rcPath, $enc)
+                $rc = 0
+                try {
+                    $limit  = [int]$limitArg
+                    $nmasks = [int]$nmasksArg
+                    if ($paths.Length -lt (1 + $nmasks)) { throw 'not enough paths for masks' }
+                    $dirWire = $paths[0]
+                    $masks   = New-Object 'string[]' $nmasks
+                    for ($i = 0; $i -lt $nmasks; $i++) { $masks[$i] = $paths[1 + $i] }
+                    $hasPat = $gmode -ne '-'
+                    $pat    = $null
+                    if ($hasPat) {
+                        if ($paths.Length -lt (2 + $nmasks)) { throw 'ffind pattern path missing' }
+                        $pat = $paths[1 + $nmasks]
+                    }
+                    $fixed = $hasPat -and $gmode.Contains('f')
+                    $ci    = $hasPat -and $gmode.Contains('i')
+
+                    $dir = Convert-PosixToWin $dirWire
+                    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw 'not a directory' }
+
+                    # Content-search primitives inlined into the job body:
+                    # Start-Job's runspace does not inherit helper.ps1's
+                    # top-level functions, so every helper the body needs
+                    # lives here alongside it. Same idea as Walk-Tree above.
+                    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+                    $utf8bare = [System.Text.UTF8Encoding]::new($false)
+                    $bytePat = ''
+                    if ($hasPat) { $bytePat = $latin1.GetString($utf8bare.GetBytes($pat)) }
+                    $rx = $null
+                    if ($hasPat -and -not $fixed) {
+                        $opts = [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+                        if ($ci) { $opts = $opts -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
+                        $rx = New-Object System.Text.RegularExpressions.Regex($bytePat, $opts)
+                    }
+                    $chunkSize = 1MB
+                    $overlap = if ($fixed) { [Math]::Max(0, $bytePat.Length - 1) } else { 8192 }
+                    $strCmp = if ($ci) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+                    $reparse = [System.IO.FileAttributes]::ReparsePoint
+                    $readOnly = [System.IO.FileAttributes]::ReadOnly
+
+                    $killPath = Join-Path $jd 'kill'
+                    $out = New-Object System.IO.StreamWriter($outPath, $false, $enc)
+                    try {
+                        # Mirror the sync ffind reply shape: mode marker
+                        # first, then stat-formatted entries per hit.
+                        $out.WriteLine('M stat')
+                        $out.Flush()
+
+                        $count = 0
+                        $scanned = 0L
+                        $stack = New-Object System.Collections.Generic.Stack[string]
+                        $stack.Push($dir)
+                        :outer while ($stack.Count -gt 0 -and $count -lt $limit) {
+                            if (Test-Path -LiteralPath $killPath) { break outer }
+                            $cur = $stack.Pop()
+                            $files = $null
+                            try { $files = [System.IO.Directory]::EnumerateFiles($cur) } catch { }
+                            if ($null -ne $files) {
+                                foreach ($fp in $files) {
+                                    if ($count -ge $limit) { break outer }
+                                    $fi = $null
+                                    try { $fi = New-Object System.IO.FileInfo $fp } catch { continue }
+                                    if ($fi.Attributes -band $reparse) { continue }
+                                    $scanned++
+                                    if (($scanned % 500) -eq 0) {
+                                        # P line: last-visited path plus
+                                        # running counters. Format matches
+                                        # what parseFFindProgress expects on
+                                        # the client side.
+                                        $wp = ''
+                                        try { $wp = $fi.FullName.Replace('\', '/') } catch { }
+                                        $out.WriteLine("P $scanned $count $wp")
+                                        $out.Flush()
+                                        if (Test-Path -LiteralPath $killPath) { break outer }
+                                    }
+                                    # Mask match on the bare name.
+                                    $ok = $false
+                                    foreach ($m in $masks) {
+                                        if ($fi.Name -like $m) { $ok = $true; break }
+                                    }
+                                    if (-not $ok) { continue }
+                                    # Byte-level content match if requested.
+                                    if ($hasPat) {
+                                        $found = $false
+                                        $fs = $null
+                                        try {
+                                            $fs = [System.IO.File]::Open($fi.FullName, [System.IO.FileMode]::Open,
+                                                                         [System.IO.FileAccess]::Read,
+                                                                         [System.IO.FileShare]::ReadWrite)
+                                            $buf = New-Object 'byte[]' ($chunkSize + $overlap)
+                                            $carry = 0
+                                            while (-not $found) {
+                                                $got = $fs.Read($buf, $carry, $chunkSize)
+                                                if ($got -le 0) { break }
+                                                $have = $carry + $got
+                                                $chunk = $latin1.GetString($buf, 0, $have)
+                                                if ($fixed) {
+                                                    if ($chunk.IndexOf($bytePat, $strCmp) -ge 0) { $found = $true; break }
+                                                } else {
+                                                    if ($rx.IsMatch($chunk)) { $found = $true; break }
+                                                }
+                                                if ($overlap -gt 0 -and $have -gt $overlap) {
+                                                    [Array]::Copy($buf, $have - $overlap, $buf, 0, $overlap)
+                                                    $carry = $overlap
+                                                } else { $carry = 0 }
+                                            }
+                                        } catch { $found = $false } finally {
+                                            if ($null -ne $fs) { $fs.Dispose() }
+                                        }
+                                        if (-not $found) { continue }
+                                    }
+                                    # Emit stat-formatted entry with full
+                                    # wire path in the name field.
+                                    $mode = 0x8000
+                                    if ($fi.Attributes -band $reparse) { $mode = 0xA000 }
+                                    $perm = if ($fi.Attributes -band $readOnly) { 0x1A4 } else { 0x1ED }
+                                    $mt = 0L; $at = 0L; $ct = 0L
+                                    try { $mt = [int64]([DateTimeOffset]::new($fi.LastWriteTimeUtc, [TimeSpan]::Zero)).ToUnixTimeSeconds() } catch { }
+                                    try { $at = [int64]([DateTimeOffset]::new($fi.LastAccessTimeUtc, [TimeSpan]::Zero)).ToUnixTimeSeconds() } catch { }
+                                    try { $ct = [int64]([DateTimeOffset]::new($fi.CreationTimeUtc, [TimeSpan]::Zero)).ToUnixTimeSeconds() } catch { }
+                                    $wirePath = Convert-WinToPosix $fi.FullName
+                                    $out.WriteLine(("{0:x} {1} {2} {3} {4} 0 0 {5}" -f ($mode -bor $perm), $fi.Length, $mt, $at, $ct, $wirePath))
+                                    $count++
+                                }
+                            }
+                            $subs = $null
+                            try { $subs = [System.IO.Directory]::EnumerateDirectories($cur) } catch { }
+                            if ($null -ne $subs) {
+                                foreach ($sd in $subs) {
+                                    try {
+                                        $di = New-Object System.IO.DirectoryInfo $sd
+                                        if ($di.Attributes -band $reparse) { continue }
+                                        $stack.Push($sd)
+                                    } catch { }
+                                }
+                            }
+                        }
+                        $out.WriteLine("T $count")
+                        $out.Flush()
+                    } finally { $out.Dispose() }
+                } catch {
+                    [System.IO.File]::AppendAllText($errPath, $_.Exception.Message + "`n", $enc)
+                    $rc = 1
+                }
+                [System.IO.File]::WriteAllText($rcPath, $rc.ToString(), $enc)
+            }
             try {
                 switch ($kind) {
-                    'scan' { Run-JobScan (Convert-PosixToWin $paths[0]) $outP $errP $rcP $utf8NoBom }
-                    'hash' { Run-JobHash (Convert-PosixToWin $paths[0]) $jd $outP $errP $rcP $utf8NoBom }
-                    'exec' { Run-JobExec $paths[0] $paths[1] $outP $errP $rcP $utf8NoBom }
+                    'scan'  { Run-JobScan (Convert-PosixToWin $paths[0]) $outP $errP $rcP $utf8NoBom }
+                    'hash'  { Run-JobHash (Convert-PosixToWin $paths[0]) $jd $outP $errP $rcP $utf8NoBom }
+                    'exec'  { Run-JobExec $paths[0] $paths[1] $outP $errP $rcP $utf8NoBom }
+                    'ffind' { Run-JobFFind $paths $xa1 $xa2 $xa3 $jd $outP $errP $rcP $utf8NoBom }
                 }
             } catch {
                 [System.IO.File]::AppendAllText($errP, $_.Exception.Message + "`n", $utf8NoBom)
@@ -1637,9 +1807,9 @@ function Cmd-JStart {
             }
         }
         if (Test-ThreadJobAvailable) {
-            $j = Start-ThreadJob -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP
+            $j = Start-ThreadJob -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP, $xa1, $xa2, $xa3
         } else {
-            $j = Start-Job -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP
+            $j = Start-Job -ScriptBlock $body -ArgumentList $kind, $paths, $jd, $outP, $errP, $rcP, $xa1, $xa2, $xa3
         }
         $script:F4Jobs[$slot.Id] = $j
         [System.IO.File]::WriteAllText((Join-Path $jd 'pid'), $j.Id.ToString(), $utf8NoBom)
@@ -1853,7 +2023,7 @@ function Invoke-JCleanup {
 # "hash:<tool>" is what gates the duplicate search on the client side
 # (Features.HashTool, checked by CanHash); announcing sha256sum alone is
 # not enough, exactly as in helper.sh where the two are separate tags.
-$F4FEATS = 'flavor:pwsh base64 grep sed awk wc head tail truncate touch date sha256sum findbin jobs cp dd readlink du chown mode:stat hash:sha256sum read:filestream write:b64 headc headsafe tailc ddnotrunc statl ddbytes awkflush'
+$F4FEATS = 'flavor:pwsh base64 grep sed awk wc head tail truncate touch date sha256sum findbin jobs ffindjob cp dd readlink du chown mode:stat hash:sha256sum read:filestream write:b64 headc headsafe tailc ddnotrunc statl ddbytes awkflush'
 
 try {
     # A leading LF ensures the terminator starts a line even if the
@@ -1865,7 +2035,10 @@ try {
         $reqLine = Read-Line
         if ($null -eq $reqLine) { break }
         if ($reqLine -eq '') { continue }
-        $parts = $reqLine.Split(' ', 5)
+        # Room for six positional args after id + cmd. jstart ffind needs
+        # five (kind, npaths, limit, nmasks, gmode) — every other command
+        # uses three or fewer.
+        $parts = $reqLine.Split(' ', 8)
         if ($parts.Length -lt 2) { continue }
         if (-not (Test-IsUInt $parts[0])) { continue }
         $script:F4ID = [int64]$parts[0]
@@ -1873,6 +2046,8 @@ try {
         $a1 = if ($parts.Length -ge 3) { $parts[2] } else { '' }
         $a2 = if ($parts.Length -ge 4) { $parts[3] } else { '' }
         $a3 = if ($parts.Length -ge 5) { $parts[4] } else { '' }
+        $a4 = if ($parts.Length -ge 6) { $parts[5] } else { '' }
+        $a5 = if ($parts.Length -ge 7) { $parts[6] } else { '' }
 
         switch ($cmd) {
             'noop'   { Cmd-Noop }
@@ -1899,7 +2074,7 @@ try {
             'grep'   { Cmd-Grep $a1 $a2 }
             'lidx'   { Cmd-LineIdx $a1 $a2 }
             'ffind'  { Cmd-FFind $a1 $a2 $a3 }
-            'jstart' { Cmd-JStart $a1 $a2 }
+            'jstart' { Cmd-JStart $a1 $a2 $a3 $a4 $a5 }
             'jpoll'  { Cmd-JPoll $a1 $a2 }
             'jkill'  { Cmd-JKill $a1 }
             'jdrop'  { Cmd-JDrop $a1 }
