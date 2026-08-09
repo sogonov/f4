@@ -1100,6 +1100,47 @@ function Cmd-LineIdx {
     } catch { Write-Err $_.Exception.Message }
 }
 
+# Decides whether a file should be opened for content search. .NET's
+# StreamReader.ReadLine — which [System.IO.File]::ReadLines drives —
+# reads up to the next 0x0A byte before returning. On a binary file
+# (video, disk image, model dump) that byte may be gigabytes away, so
+# a single "line" allocation ends up buying the whole file into memory
+# — a real report from an Alt+F7 across C:\Users had powershell.exe
+# swell to 1-2 GB. helper.sh sidesteps this by piping through grep -a,
+# which is byte-based; there is no byte-based .NET equivalent that is
+# nearly as cheap.
+#
+# The check is a size cap plus a NUL-byte sniff on the first few KB —
+# text files essentially never have NUL bytes in their prose, so any
+# meaningful count of them means the file is binary and is skipped
+# regardless of size. Text files still get searched up to a generous
+# cap (log files can be 100 MB and are worth searching), above which
+# they too are skipped to keep the worst case bounded.
+$F4ContentMaxSize   = 512MB   # cap for text-like files
+$F4ContentBlobLimit = 2GB     # above this, don't even bother sniffing
+$F4ContentSniffLen  = 4096    # bytes to peek for NUL detection
+function Test-ContentSearchable {
+    param([System.IO.FileInfo]$fi)
+    if ($fi.Length -eq 0) { return $true }
+    if ($fi.Length -gt $F4ContentBlobLimit) { return $false }
+    $want = [int]([Math]::Min([int64]$F4ContentSniffLen, $fi.Length))
+    $head = New-Object 'byte[]' $want
+    $read = 0
+    try {
+        $fs = [System.IO.File]::Open($fi.FullName, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::Read,
+                                     [System.IO.FileShare]::ReadWrite)
+        try { $read = $fs.Read($head, 0, $want) } finally { $fs.Dispose() }
+    } catch { return $false }
+    $nulls = 0
+    for ($i = 0; $i -lt $read; $i++) { if ($head[$i] -eq 0) { $nulls++ } }
+    # 1% NUL bytes in the head is well above what any text file has and
+    # well below what any binary has, so it separates them cleanly.
+    if ($nulls -gt ($read / 100)) { return $false }
+    if ($fi.Length -gt $F4ContentMaxSize) { return $false }
+    return $true
+}
+
 # ---------------------------------------------------------------------
 # ffind <limit> <nmasks> <grep mode>: walk a whole tree, emit
 # stat-shaped entries for hits, up to <limit>. If grep mode != '-',
@@ -1165,6 +1206,9 @@ function Cmd-FFind {
                     }
                     if (-not $ok) { continue }
                     if ($pat -ne $null) {
+                        # Cheap sniff to avoid reading a whole binary
+                        # as a single "line" — see Test-ContentSearchable.
+                        if (-not (Test-ContentSearchable $fi)) { continue }
                         $hit = $false
                         try {
                             if ($fixed) {
