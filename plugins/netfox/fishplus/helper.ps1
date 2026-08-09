@@ -1377,14 +1377,34 @@ function Cmd-JStart {
                     $psi.UseShellExecute = $false
                     $psi.RedirectStandardOutput = $true
                     $psi.RedirectStandardError  = $true
+                    # stdin has to be redirected and closed straight away.
+                    # Without it a child inherits the parent runspace's stdin,
+                    # which on the outer helper is the SSH channel: a program
+                    # that probes stdin (git checking isatty, ssh-agent,
+                    # anything that reads config from stdin) would swallow
+                    # bytes meant for the next protocol request, and one that
+                    # actually blocks on stdin would hang the whole job.
+                    # helper.sh does the same with "</dev/null" at the shell
+                    # level.
+                    $psi.RedirectStandardInput  = $true
                     if ($null -ne $cwd) { $psi.WorkingDirectory = $cwd }
                     $p = [System.Diagnostics.Process]::Start($psi)
+                    $p.StandardInput.Close()
+                    # stdout and stderr are drained concurrently: a program
+                    # that fills its stderr pipe (a couple of KB on Windows)
+                    # blocks writing until we consume it, and reading stdout
+                    # to end first would wait for a child that cannot get
+                    # there. Starting both ReadToEndAsync tasks before
+                    # WaitForExit is what keeps both pipes flowing.
+                    $outTask = $p.StandardOutput.ReadToEndAsync()
+                    $errTask = $p.StandardError.ReadToEndAsync()
+                    $p.WaitForExit()
+                    [System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask))
                     $out = New-Object System.IO.StreamWriter($outPath, $false, $enc)
                     try {
-                        while (-not $p.StandardOutput.EndOfStream) { $out.WriteLine($p.StandardOutput.ReadLine()); $out.Flush() }
-                        while (-not $p.StandardError.EndOfStream)  { $out.WriteLine($p.StandardError.ReadLine());  $out.Flush() }
+                        if (-not [string]::IsNullOrEmpty($outTask.Result)) { $out.Write($outTask.Result) }
+                        if (-not [string]::IsNullOrEmpty($errTask.Result)) { $out.Write($errTask.Result) }
                     } finally { $out.Dispose() }
-                    $p.WaitForExit()
                     [System.IO.File]::WriteAllText($rcPath, $p.ExitCode.ToString(), $enc)
                 } catch {
                     [System.IO.File]::AppendAllText($errPath, $_.Exception.Message + "`n", $enc)
