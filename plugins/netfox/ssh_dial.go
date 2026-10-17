@@ -82,46 +82,59 @@ func loadKeySigner(keyPath, pass string) (ssh.Signer, error) {
 	if err != nil && pass != "" {
 		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(pass))
 	}
-	return signer, err
+	if err != nil {
+		// A read error names the file already; a parse error does not.
+		return nil, fmt.Errorf("%s: %w", keyPath, err)
+	}
+	return signer, nil
 }
 
 // DialSSH opens an SSH connection the way every SSH based NetFox backend
-// needs it. When keyPath is set, that key is the only key offered (besides
-// whatever the ssh-agent carries) — this avoids servers that cut the
-// handshake short after a handful of failed public-key attempts
+// needs it. When keyPath is set, that key is the only key file offered, and
+// it goes ahead of whatever the ssh-agent carries — this avoids servers that
+// cut the handshake short after a handful of failed public-key attempts
 // (MaxAuthTries) before ever reaching the right key. When keyPath is empty,
-// behavior is unchanged: agent, then the usual private keys from ~/.ssh,
-// then the password. It is shared by the SFTP and the FISH+ backends so
-// that a site behaves identically whichever of them opens it.
+// it is the agent, then the usual private keys from ~/.ssh, then the
+// password. It is shared by the SFTP and the FISH+ backends so that a site
+// behaves identically whichever of them opens it.
 func DialSSH(host, port, user, pass, keyPath string, timeout int, px netproxy.Settings) (*ssh.Client, error) {
 	hostKeyCallback, err := sshHostKeyCallback()
 	if err != nil {
 		return nil, err
 	}
 
-	auths := []ssh.AuthMethod{}
 	var agentConn io.ReadWriteCloser
-
+	var agentClient agent.ExtendedAgent
 	if conn, err := openSSHAgent(); err == nil {
 		agentConn = conn
-		agentClient := newSSHAgentClient(conn)
-		auths = append(auths, ssh.PublicKeysCallback(agentClient.Signers))
+		agentClient = newSSHAgentClient(conn)
 	}
 
+	var named, defaults []ssh.Signer
+	// A named key that cannot be used does not stop the dial — the agent may
+	// hold the same key, unlocked — but if the dial then fails, the reason
+	// goes into the error instead of leaving a bare "unable to authenticate".
+	var namedErr error
 	if keyPath != "" {
 		if signer, err := loadKeySigner(keyPath, pass); err == nil {
-			auths = append(auths, ssh.PublicKeys(signer))
+			named = append(named, signer)
+		} else {
+			namedErr = err
 		}
 	} else {
 		home, _ := hostmode.UserHomeDir()
 		for _, keyName := range []string{"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"} {
 			defaultKeyPath := filepath.Join(home, ".ssh", keyName)
 			if signer, err := loadKeySigner(defaultKeyPath, pass); err == nil {
-				auths = append(auths, ssh.PublicKeys(signer))
+				defaults = append(defaults, signer)
 			}
 		}
 	}
 
+	auths := []ssh.AuthMethod{}
+	if len(named) > 0 || agentClient != nil || len(defaults) > 0 {
+		auths = append(auths, sshPublicKeys(named, agentClient, defaults))
+	}
 	if pass != "" {
 		auths = append(auths, ssh.Password(pass))
 	}
@@ -139,6 +152,9 @@ func DialSSH(host, port, user, pass, keyPath string, timeout int, px netproxy.Se
 		if agentConn != nil {
 			_ = agentConn.Close() // Preserve the SSH dial failure.
 		}
+		if namedErr != nil {
+			return nil, fmt.Errorf("%w (key file not used: %v)", err, namedErr)
+		}
 		return nil, err
 	}
 	if agentConn != nil {
@@ -148,6 +164,39 @@ func DialSSH(host, port, user, pass, keyPath string, timeout int, px netproxy.Se
 		_ = agentConn.Close()
 	}
 	return client, nil
+}
+
+// sshPublicKeys offers every key DialSSH has in a single publickey method.
+// x/crypto/ssh uses only the first AuthMethod of each RFC 4252 kind: once
+// that one has failed, any further ssh.PublicKeys in ClientConfig.Auth is
+// skipped untried. An agent that runs but holds no keys fails at once — the
+// Windows OpenSSH agent service does just that out of the box — and used to
+// cost the key files their turn (f4#1927).
+//
+// The order is named, agent, defaults, as DialSSH documents it. A key that
+// both the agent and a file hold is offered once, since every offer counts
+// against the server's MaxAuthTries.
+func sshPublicKeys(named []ssh.Signer, agentClient agent.ExtendedAgent, defaults []ssh.Signer) ssh.AuthMethod {
+	return ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		var fromAgent []ssh.Signer
+		if agentClient != nil {
+			// An agent that cannot list its keys must not cost the key files
+			// their turn either.
+			fromAgent, _ = agentClient.Signers()
+		}
+		var signers []ssh.Signer
+		seen := make(map[string]bool)
+		for _, group := range [][]ssh.Signer{named, fromAgent, defaults} {
+			for _, signer := range group {
+				key := string(signer.PublicKey().Marshal())
+				if !seen[key] {
+					seen[key] = true
+					signers = append(signers, signer)
+				}
+			}
+		}
+		return signers, nil
+	})
 }
 
 func sshHostKeyCallback() (ssh.HostKeyCallback, error) {

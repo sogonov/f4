@@ -2,14 +2,17 @@ package netfox
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/unxed/f4/internal/netproxy"
@@ -30,12 +33,148 @@ func TestDialSSHAuthenticatesWithSSHAgent(t *testing.T) {
 	port, hostKey := startTestSSHServerWithPublicKey(t, sshPublicKeyFromEd25519(t, publicKey))
 	writeKnownHosts(t, home, knownhosts.Normalize("127.0.0.1:"+port), hostKey)
 
-	client, err := DialSSH("127.0.0.1", port, "agent-user", "", "", 3, netproxy.Settings{})
+	client, err := DialSSH("127.0.0.1", port, "key-user", "", "", 3, netproxy.Settings{})
 	if err != nil {
 		t.Fatalf("SSH agent authentication failed: %v", err)
 	}
 	if err := client.Close(); err != nil {
 		t.Errorf("close SSH client: %v", err)
+	}
+}
+
+// f4#1927: an agent that runs but holds no keys -- the Windows OpenSSH agent
+// service as installed -- fails the publickey method by itself, and
+// x/crypto/ssh never tries a second publickey method after the first one
+// failed. The key file the user named was never offered.
+func TestDialSSHUsesTheKeyFileWhenTheAgentHasNoKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SSH_AUTH_SOCK", startTestSSHAgent(t))
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "site_key")
+	writeTestPrivateKey(t, keyPath, privateKey)
+	port, hostKey := startTestSSHServerWithPublicKey(t, sshPublicKeyFromEd25519(t, publicKey))
+	writeKnownHosts(t, home, knownhosts.Normalize("127.0.0.1:"+port), hostKey)
+
+	client, err := DialSSH("127.0.0.1", port, "key-user", "", keyPath, 3, netproxy.Settings{})
+	if err != nil {
+		t.Fatalf("the named key file was not offered: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Errorf("close SSH client: %v", err)
+	}
+}
+
+// The same rule without a named key file: every default key in ~/.ssh gets
+// its turn, not only the first one found.
+func TestDialSSHTriesEveryDefaultKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("SSH_AUTH_SOCK", startTestSSHAgent(t))
+	rejectedKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestPrivateKey(t, filepath.Join(home, ".ssh", "id_rsa"), rejectedKey)
+	writeTestPrivateKey(t, filepath.Join(home, ".ssh", "id_ed25519"), privateKey)
+	port, hostKey := startTestSSHServerWithPublicKey(t, sshPublicKeyFromEd25519(t, publicKey))
+	writeKnownHosts(t, home, knownhosts.Normalize("127.0.0.1:"+port), hostKey)
+
+	client, err := DialSSH("127.0.0.1", port, "key-user", "", "", 3, netproxy.Settings{})
+	if err != nil {
+		t.Fatalf("~/.ssh/id_ed25519 was not offered after ~/.ssh/id_rsa: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Errorf("close SSH client: %v", err)
+	}
+}
+
+// A named key file goes ahead of the agent's keys: a server counts every
+// rejected key against MaxAuthTries (six by default), and an agent full of
+// keys for other hosts would otherwise use them all up first.
+func TestDialSSHOffersTheKeyFileBeforeTheAgentKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	var agentKeys []agent.AddedKey
+	for range 6 {
+		_, other, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentKeys = append(agentKeys, agent.AddedKey{PrivateKey: other})
+	}
+	t.Setenv("SSH_AUTH_SOCK", startTestSSHAgent(t, agentKeys...))
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "site_key")
+	writeTestPrivateKey(t, keyPath, privateKey)
+	port, hostKey := startTestSSHServerWithPublicKey(t, sshPublicKeyFromEd25519(t, publicKey))
+	writeKnownHosts(t, home, knownhosts.Normalize("127.0.0.1:"+port), hostKey)
+
+	client, err := DialSSH("127.0.0.1", port, "key-user", "", keyPath, 3, netproxy.Settings{})
+	if err != nil {
+		t.Fatalf("the agent's keys used up MaxAuthTries before the named key file: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Errorf("close SSH client: %v", err)
+	}
+}
+
+// A named key file that cannot be used is named in the failure rather than
+// disappearing behind "unable to authenticate".
+func TestDialSSHNamesAKeyFileItCouldNotUse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, path string)
+	}{
+		{"missing", func(*testing.T, string) {}},
+		{"passphrase protected", func(t *testing.T, path string) {
+			_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			block, err := ssh.MarshalPrivateKeyWithPassphrase(privateKey, "", []byte("secret"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("SSH_AUTH_SOCK", startTestSSHAgent(t))
+			port, hostKey := startTestSSHServerWithPublicKey(t, testSSHHostKey(t))
+			writeKnownHosts(t, home, knownhosts.Normalize("127.0.0.1:"+port), hostKey)
+			keyPath := filepath.Join(home, "site_key")
+			tc.write(t, keyPath)
+
+			client, err := DialSSH("127.0.0.1", port, "key-user", "", keyPath, 3, netproxy.Settings{})
+			if err == nil {
+				if closeErr := client.Close(); closeErr != nil {
+					t.Errorf("close SSH client: %v", closeErr)
+				}
+				t.Fatal("authenticated without a usable key")
+			}
+			if !strings.Contains(err.Error(), keyPath) {
+				t.Fatalf("the failure does not name the key file %s: %v", keyPath, err)
+			}
+		})
 	}
 }
 
@@ -46,6 +185,22 @@ func sshPublicKeyFromEd25519(t *testing.T, public ed25519.PublicKey) ssh.PublicK
 		t.Fatal(err)
 	}
 	return key
+}
+
+// writeTestPrivateKey stores key the way ssh-keygen does: OpenSSH format, no
+// passphrase.
+func writeTestPrivateKey(t *testing.T, path string, key crypto.PrivateKey) {
+	t.Helper()
+	block, err := ssh.MarshalPrivateKey(key, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSSHHostKeyCallbackAcceptsKnownKey(t *testing.T) {
@@ -226,7 +381,7 @@ func startTestSSHServerWithPublicKey(t *testing.T, authKey ssh.PublicKey) (strin
 	}
 	if authKey != nil {
 		config.PublicKeyCallback = func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if conn.User() == "agent-user" && bytes.Equal(key.Marshal(), authKey.Marshal()) {
+			if conn.User() == "key-user" && bytes.Equal(key.Marshal(), authKey.Marshal()) {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("test SSH server rejected public key")
