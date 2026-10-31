@@ -3967,6 +3967,23 @@ func (fp *FileSystemPanel) processKey(e *vtinput.InputEvent, allowProviderPanelE
 			vtui.FrameManager.Redraw()
 			return true
 		}
+		if isFastFindClearKey(e) {
+			// Like erasing the last character with Backspace, an empty text
+			// ends a quick search; the filter stays open over every row and
+			// keeps its anywhere/start-of-name mode.
+			if strings.HasPrefix(fp.FastFindStr, "*") {
+				fp.FastFindStr = "*"
+			} else {
+				fp.FastFindStr = ""
+			}
+			if !fp.autoFilterMode {
+				fp.ExitFastFind()
+			} else {
+				fp.applyFastFind()
+			}
+			vtui.FrameManager.Redraw()
+			return true
+		}
 		// Up and Down never reach this point: the cursor-moving search gave
 		// them back to ordinary navigation above, and under the filter they
 		// have to walk the narrowed list, which the navigation switch below
@@ -3984,9 +4001,9 @@ func (fp *FileSystemPanel) processKey(e *vtinput.InputEvent, allowProviderPanelE
 			fp.ExitFastFind()
 			vtui.FrameManager.Redraw()
 			// Проваливаемся ниже, чтобы обработать Enter как вход в файл/директорию
-		} else if e.Char != 0 && !ctrl {
+		} else if ch := fastFindChar(e); ch != 0 {
 			previous := fp.FastFindStr
-			fp.FastFindStr += string(unicode.ToLower(e.Char))
+			fp.FastFindStr += string(ch)
 			if !fp.fastFindHasMatches() {
 				fp.FastFindStr = previous
 				return true
