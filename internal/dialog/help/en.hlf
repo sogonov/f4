@@ -1044,6 +1044,15 @@ and the other formats need ffmpeg.
                           a track of the playlist is never swapped for the
                           file under the cursor.
 
+ #Playing the playlist#
+
+  The playlist plays from the top down, its folders included, and stops
+after its last track. A track whose file is gone from the disk, or which
+does not load, is passed over. One picked with Enter that does not play says
+why on the top row of the player, and Next goes on from it. Play (X, K, the
+[ > ] button) after Stop starts the stopped track again; Enter on a track
+plays that track.
+
  #Keys in the player#
 
   The cursor walks one column: the playback bar, the buttons, the playlist.

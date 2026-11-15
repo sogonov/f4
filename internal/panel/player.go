@@ -413,7 +413,7 @@ func (pp *PlayerPanel) pressButton(b int) {
 		case pp.cursor >= 0 && pp.cursor < len(pp.rows) && !pp.rows[pp.cursor].item.Folder:
 			pp.playItem(pp.rows[pp.cursor].item)
 		default:
-			pp.playRelative(+1)
+			pp.playStopped()
 		}
 	case playerBtnPause:
 		pp.Engine.TogglePause()

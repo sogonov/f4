@@ -213,6 +213,13 @@ the next track. A `PlayerPanel` shows the session and keeps only the cursor
 and the buttons; a second player, in another workspace, shows the same one.
 The session ends when no player shows it and nothing is loaded.
 
+Where playback is in the playlist is `playerSession.at`: the track loaded,
+the one that would not load, or the one that was stopped. Next and Previous
+(`playRelative`) go on from it, passing over a track whose file is gone and
+one that does not load, and Play with nothing loaded (`playStopped`) starts
+it again. It was the track loaded: Enter on a track that was not there any
+more left none, and Next went back to the first track (#2185).
+
 Closing the player while something plays (`ToggleAltPanel`: Ctrl+Shift+M,
 or another alternative panel opened in its slot) asks first
 (`altPanelCloseAsker`): In the background, Stop, or Cancel and Esc, which

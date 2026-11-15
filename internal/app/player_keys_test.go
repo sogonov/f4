@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -522,5 +523,83 @@ func TestPlayerSeeksFromTheFilePanel(t *testing.T) {
 	f.press(playerKey(vtinput.VK_LEFT, ctrlAlt))
 	if got := f.audio.Position(); got != 5*time.Second {
 		t.Errorf("two Ctrl+Alt+Right and a Ctrl+Alt+Left left the track at %s, want 5s", got)
+	}
+}
+
+// playlistOf is the fixture's files in the playlist, in their order, and the
+// focus in the player with its cursor on the first of them.
+func (f *playerFixture) playlistOf(names ...string) {
+	f.t.Helper()
+	for range names {
+		f.press(playerKey(vtinput.VK_INSERT, 0))
+	}
+	f.press(playerKey(vtinput.VK_F5, 0))
+	f.press(playerKey(vtinput.VK_TAB, 0))
+	if got := f.player.GetSelectedName(); !f.player.IsFocused() || got != strings.TrimSuffix(names[0], ".mp3") {
+		f.t.Fatalf("after F5 and Tab: player focused=%v, cursor on %q; want the focus on %s", f.player.IsFocused(), got, names[0])
+	}
+}
+
+// Enter on a playlist track whose file is gone says so on the player, and
+// Next went to the first track of the playlist, not to the one after the
+// missing track (#2185, on Windows 11).
+func TestPlayerNextGoesOnFromATrackThatIsNotThere(t *testing.T) {
+	f := newPlayerFixture(t, "a.mp3", "b.mp3", "c.mp3")
+	f.playlistOf("a.mp3", "b.mp3", "c.mp3")
+	if err := os.Remove(f.path("b.mp3")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.press(playerKey(vtinput.VK_DOWN, 0))
+	f.press(playerKey(vtinput.VK_RETURN, 0))
+	if got := f.audio.Path(); got != "" {
+		t.Fatalf("Enter on b, which is not there, loaded %q", got)
+	}
+	f.press(playerChar(vtinput.VK_B, 'b'))
+	if got := f.audio.Path(); got != f.path("c.mp3") {
+		t.Errorf("Next after b, which is not there, loaded %q, want c.mp3 (loads %q)", got, f.audio.Loads)
+	}
+}
+
+// Next and Previous pass over a track whose file was deleted after it went
+// into the playlist (#2185).
+func TestPlayerNextAndPreviousPassOverATrackThatIsNotThere(t *testing.T) {
+	f := newPlayerFixture(t, "a.mp3", "b.mp3", "c.mp3")
+	f.playlistOf("a.mp3", "b.mp3", "c.mp3")
+	f.press(playerKey(vtinput.VK_RETURN, 0))
+	if err := os.Remove(f.path("b.mp3")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.press(playerChar(vtinput.VK_B, 'b'))
+	if got := f.audio.Path(); got != f.path("c.mp3") {
+		t.Fatalf("Next from a past b, which is not there, loaded %q, want c.mp3", got)
+	}
+	f.press(playerChar(vtinput.VK_Z, 'z'))
+	if got := f.audio.Path(); got != f.path("a.mp3") {
+		t.Errorf("Previous from c past b loaded %q, want a.mp3", got)
+	}
+	f.press(playerChar(vtinput.VK_Z, 'z'))
+	if got := f.audio.Path(); got != f.path("a.mp3") || !f.audio.IsPlaying() {
+		t.Errorf("Previous on the first track: %q, playing=%v; want a.mp3 to go on playing", got, f.audio.IsPlaying())
+	}
+}
+
+// Play after Stop, from the buttons, starts the track that was stopped, as
+// WinAmp's does; it started the playlist over.
+func TestPlayerPlayAfterStopStartsTheStoppedTrack(t *testing.T) {
+	f := newPlayerFixture(t, "a.mp3", "b.mp3")
+	f.playlistOf("a.mp3", "b.mp3")
+	f.press(playerKey(vtinput.VK_DOWN, 0))
+	f.press(playerKey(vtinput.VK_RETURN, 0))
+	f.press(playerChar(vtinput.VK_V, 'v'))
+	if got := f.audio.Path(); got != "" {
+		t.Fatalf("V (Stop) left %q loaded", got)
+	}
+
+	f.press(playerKey(vtinput.VK_HOME, vtinput.LeftCtrlPressed)) // the buttons
+	f.press(playerChar(vtinput.VK_X, 'x'))
+	if got := f.audio.Path(); got != f.path("b.mp3") || !f.audio.IsPlaying() {
+		t.Errorf("X (Play) after Stop on b: %q, playing=%v; want b.mp3 playing", got, f.audio.IsPlaying())
 	}
 }

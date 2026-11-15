@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,16 +16,23 @@ import (
 type tickEngine struct {
 	path                      string
 	loaded, playing, finished bool
+	refuse                    map[string]bool // files Load fails on, as on one that is not audio
 }
 
 func (e *tickEngine) Load(path string) error {
-	*e = tickEngine{path: path, loaded: true}
+	e.Stop()
+	if e.refuse[path] {
+		return errors.New("not an audio file")
+	}
+	e.path, e.loaded = path, true
 	return nil
 }
-func (e *tickEngine) Close()                       { e.Stop() }
-func (e *tickEngine) Play()                        { e.playing = e.loaded }
-func (e *tickEngine) TogglePause() bool            { e.playing = !e.playing && e.loaded; return e.playing }
-func (e *tickEngine) Stop()                        { *e = tickEngine{} }
+func (e *tickEngine) Close()            { e.Stop() }
+func (e *tickEngine) Play()             { e.playing = e.loaded }
+func (e *tickEngine) TogglePause() bool { e.playing = !e.playing && e.loaded; return e.playing }
+func (e *tickEngine) Stop() {
+	e.path, e.loaded, e.playing, e.finished = "", false, false, false
+}
 func (e *tickEngine) Seek(time.Duration) bool      { return e.loaded }
 func (e *tickEngine) IsPlaying() bool              { return e.playing }
 func (e *tickEngine) IsLoaded() bool               { return e.loaded }
@@ -128,6 +136,23 @@ func TestPlayerTickMovesOnFromATrackThatEnded(t *testing.T) {
 	s.step()
 	if eng.loaded || !redrawRequested() {
 		t.Fatalf("after the last track's end: engine %+v; want it stopped and a redraw", *eng)
+	}
+}
+
+// A track that does not load is passed over at the end of the one before it,
+// as one that is not there is; it stopped the music.
+func TestPlayerTickPassesOverATrackThatDoesNotLoad(t *testing.T) {
+	s, eng, _ := tickFixture(t, false)
+	c := filepath.Join(t.TempDir(), "c.mp3")
+	if err := os.WriteFile(c, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.root.insertChild(-1, &playlistItem{Name: "c", Path: c})
+	eng.refuse = map[string]bool{s.root.Children[1].Path: true} // b
+	eng.playing, eng.finished = false, true
+	s.step()
+	if eng.path != c || !eng.playing {
+		t.Errorf("after a's end, with b refused: engine %+v; want c playing", *eng)
 	}
 }
 
