@@ -226,3 +226,59 @@ func TestAudioEngineHoldsTheOutputOnlyWhilePlaying(t *testing.T) {
 	a.Stop()
 	check("Stop", false)
 }
+
+// A track goes on playing after the device was suspended and resumed. On
+// Linux with PulseAudio (PipeWire's included) it did not: Stop or a pause of
+// more than the delay, and nothing played again until f4 was restarted
+// (#2185). oto corked the stream on Suspend, and on Resume the Started event
+// of the server parked the library's reader for good; oto v3.5.0 suspends by
+// holding the read callback alone. The test needs a device that plays in
+// real time, and is skipped elsewhere; the Windows arm64 runner of CI has a
+// device on which the track moved 46ms in a second after the resume.
+func TestAudioEngineGoesOnPlayingAfterTheOutputWasSuspended(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "silence.wav")
+	if err := os.WriteFile(path, wavBytes(1, 2, 44100, 16, make([]byte, 5*44100*AudioBytesPerFrame)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := NewAudioEngine()
+	if err := a.Load(path); err != nil {
+		t.Skipf("no audio output here: %v", err)
+	}
+	defer a.Close()
+	// playsFor is how far the track got in d of playing.
+	playsFor := func(d time.Duration) time.Duration {
+		from := a.Position()
+		time.Sleep(d)
+		return a.Position() - from
+	}
+	a.Play()
+	before := playsFor(500 * time.Millisecond)
+	if before < 250*time.Millisecond {
+		t.Skipf("the output here does not play in real time: the track moved %s in 500ms", before)
+	}
+
+	a.power.mu.Lock()
+	a.power.delay = 50 * time.Millisecond
+	a.power.mu.Unlock()
+	t.Cleanup(func() {
+		a.power.mu.Lock()
+		a.power.delay = outputSuspendDelay
+		a.power.mu.Unlock()
+	})
+	a.Pause()
+	suspended := func() bool {
+		a.power.mu.Lock()
+		defer a.power.mu.Unlock()
+		return a.power.suspended
+	}
+	for deadline := time.Now().Add(2 * time.Second); !suspended(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the output was not suspended while the track was paused")
+		}
+	}
+
+	a.Play()
+	if moved := playsFor(time.Second); moved < 500*time.Millisecond {
+		t.Fatalf("after the output was suspended and resumed the track moved %s in 1s of playing, %s in 500ms before; want it to play on", moved, before)
+	}
+}

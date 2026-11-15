@@ -34,10 +34,11 @@ type outputPower struct {
 	after func(time.Duration, func()) (stop func() bool) // time.AfterFunc
 
 	mu        sync.Mutex
-	holders   int       // the players that play
-	suspended bool      // what the device was last asked to be
-	lastCall  time.Time // when it was asked, or when the device started
-	idleSince time.Time // when the last holder let go
+	delay     time.Duration // outputSuspendDelay; shorter in a test on the real device
+	holders   int           // the players that play
+	suspended bool          // what the device was last asked to be
+	lastCall  time.Time     // when it was asked, or when the device started
+	idleSince time.Time     // when the last holder let go
 	stop      func() bool
 }
 
@@ -51,7 +52,7 @@ func afterFunc(d time.Duration, f func()) func() bool { return time.AfterFunc(d,
 // newOutputPower takes over a device that has just started and has nothing to
 // play yet; it is suspended unless something plays within the delay.
 func newOutputPower(dev outputDevice, now func() time.Time, after func(time.Duration, func()) func() bool) *outputPower {
-	p := &outputPower{dev: dev, now: now, after: after}
+	p := &outputPower{dev: dev, now: now, after: after, delay: outputSuspendDelay}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.lastCall = now()
@@ -95,7 +96,7 @@ func (p *outputPower) reconcileLocked() {
 		return
 	}
 	due := p.lastCall.Add(outputSettle)
-	if idle := p.idleSince.Add(outputSuspendDelay); suspend && idle.After(due) {
+	if idle := p.idleSince.Add(p.delay); suspend && idle.After(due) {
 		due = idle
 	}
 	if wait := due.Sub(p.now()); wait > 0 {
@@ -113,7 +114,7 @@ func (p *outputPower) reconcileLocked() {
 			vtui.DebugLog("AUDIO: suspending the output failed: %v", err)
 			return
 		}
-		vtui.DebugLog("AUDIO: output suspended, nothing has played for %s", outputSuspendDelay)
+		vtui.DebugLog("AUDIO: output suspended, nothing has played for %s", p.delay)
 		return
 	}
 	if err := p.dev.Resume(); err != nil {
