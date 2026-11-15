@@ -54,6 +54,16 @@ container has no sound device, and `oto.NewContext` failing is reported in
 the title row of the panel rather than crashing. **First thing to do on a
 real machine: press F5 on an MP3 and listen.**
 
+oto has to be v3.5.0 or later. f4 suspends the device while nothing plays
+(`outputPower`, `internal/media/audio_power.go`), and oto before v3.5.0
+corked the PulseAudio stream on Suspend: on Resume the server's Started
+event parked the reader goroutine of `jfreymuth/pulse` for good, and on
+Linux with PulseAudio or PipeWire nothing played again after Stop or a
+pause of more than two seconds until f4 was restarted (#2185; oto
+87e257b0, "suspend the PulseAudio stream without corking").
+`TestAudioEngineGoesOnPlayingAfterTheOutputWasSuspended` checks it on a
+machine with a sound device and is skipped on CI, which has none.
+
 `beep` was not used: it wraps oto with its own streamer abstraction and
 brings `faiface/beep`'s `speaker` global, and at this size the wrapper does
 not pay for itself. If the player grows formats (§3), `gopxl/beep/v2`'s
@@ -237,8 +247,8 @@ Known and deliberate; each is small:
 - **Position clock** subtracts `BufferedSize()` from bytes read, which is
   the right idea but untested against real hardware latency.
 - **Volume is not persisted**; add `PlayerVolume` to `AppConfig`.
-- `Player.Close` in oto is marked deprecated; it still exists in the pinned
-  alpha. If it goes, `Pause()` and dropping the reference is what the
+- `Player.Close` in oto is marked deprecated; it still exists in v3.5.1.
+  If it goes, `Pause()` and dropping the reference is what the
   library recommends.
 
 ## 3. Plan
