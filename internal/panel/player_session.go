@@ -23,6 +23,11 @@ type playerSession struct {
 	Engine  PlayerEngine
 	root    *playlistItem // invisible root; children are the top level
 	current *playlistItem // the track loaded in the engine, if any
+	// at is where playback is in the playlist: the track loaded, or the one
+	// that would not load, or the one that was stopped. Next and Previous go
+	// on from it and Play after Stop starts it again. With a track that was
+	// not there any more Next went back to the first one (#2185).
+	at      *playlistItem
 	marquee int
 	unmuted float64 // the volume M brings back
 
@@ -205,6 +210,7 @@ func (s *playerSession) playItem(it *playlistItem) bool {
 	// A playlist track takes over from the file panel queue.
 	if it.parent != nil {
 		s.queue = nil
+		s.at = it
 	}
 	s.status = ""
 	if err := s.Engine.Load(it.Path); err != nil {
@@ -312,8 +318,14 @@ func (s *playerSession) playQueueRelative(delta int) bool {
 	return false
 }
 
-// playRelative plays the track delta positions away from the current one
-// in play order. With nothing current it starts from the ends.
+// playRelative plays the track delta positions away from the one playback is
+// at (s.at) in play order. With none it starts from the ends.
+//
+// A track that is not there any more is passed over, and so is one that does
+// not load, which leaves its error on the title row. A playlist outlives the
+// files it lists: one that was deleted stopped the music at the end of the
+// track before it (#2185). Next with no track after the current one that
+// exists leaves the current one playing.
 func (s *playerSession) playRelative(delta int) bool {
 	if s.queue != nil {
 		return s.playQueueRelative(delta)
@@ -322,13 +334,7 @@ func (s *playerSession) playRelative(delta int) bool {
 	if len(list) == 0 {
 		return false
 	}
-	idx := -1
-	for i, t := range list {
-		if t == s.current {
-			idx = i
-			break
-		}
-	}
+	idx := indexOfItem(list, s.at)
 	if idx < 0 {
 		if delta > 0 {
 			idx = -1
@@ -337,15 +343,33 @@ func (s *playerSession) playRelative(delta int) bool {
 		}
 	}
 	for idx += delta; idx >= 0 && idx < len(list); idx += delta {
-		// A playlist can outlive files removed from disk. Do not let one stale
-		// entry stop playback at the end of a track or send Next back to the
-		// first item; keep going in the requested direction.
 		if _, err := os.Stat(list[idx].Path); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		return s.playItem(list[idx])
+		if s.playItem(list[idx]) {
+			return true
+		}
 	}
 	return false
+}
+
+func indexOfItem(list []*playlistItem, it *playlistItem) int {
+	for i, t := range list {
+		if t == it {
+			return i
+		}
+	}
+	return -1
+}
+
+// playStopped starts playing with nothing loaded: the track playback stopped
+// at, as WinAmp's Play does after Stop, or with that one gone from the
+// playlist or from the disk the next one. Play started the playlist over.
+func (s *playerSession) playStopped() bool {
+	if s.queue == nil && indexOfItem(s.root.tracks(nil), s.at) >= 0 && s.playItem(s.at) {
+		return true
+	}
+	return s.playRelative(+1)
 }
 
 // playPause pauses or goes on playing, or with nothing loaded starts the
@@ -355,7 +379,7 @@ func (s *playerSession) playPause() {
 		s.Engine.TogglePause()
 		return
 	}
-	s.playRelative(+1)
+	s.playStopped()
 }
 
 func (s *playerSession) adjustVolume(delta float64) {

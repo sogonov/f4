@@ -1,6 +1,7 @@
 package paneltest
 
 import (
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -61,11 +62,17 @@ func (a *FakeAudio) Path() string {
 	return a.path
 }
 
+// Load fails as media.AudioEngine's does for a file that is not there: what
+// was loaded is dropped all the same.
 func (a *FakeAudio) Load(path string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.path, a.loaded, a.playing, a.pos = path, true, false, 0
 	a.Loads = append(a.Loads, path)
+	if _, err := os.Stat(path); err != nil {
+		a.path, a.loaded, a.playing, a.pos = "", false, false, 0
+		return err
+	}
+	a.path, a.loaded, a.playing, a.pos = path, true, false, 0
 	return nil
 }
 
