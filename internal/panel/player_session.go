@@ -27,9 +27,14 @@ type playerSession struct {
 	// that would not load, or the one that was stopped. Next and Previous go
 	// on from it and Play after Stop starts it again. With a track that was
 	// not there any more Next went back to the first one (#2185).
-	at      *playlistItem
-	marquee int
-	unmuted float64 // the volume M brings back
+	at *playlistItem
+	// shuffled is the playlist's tracks in the random order they play in
+	// while shuffle is on (player_order.go); intn picks it, from a test's
+	// source when it gives one.
+	shuffled []*playlistItem
+	intn     func(int) int
+	marquee  int
+	unmuted  float64 // the volume M brings back
 
 	// queue is the file panel's audio files when the current track came
 	// from Enter in the panel rather than the playlist; queuePos is the
@@ -166,7 +171,7 @@ func (s *playerSession) tickDue() bool {
 // repaints nothing.
 func (s *playerSession) step() {
 	if s.Engine.Finished() {
-		if !s.playRelative(+1) {
+		if !s.playOnAfterEnd() {
 			s.stopPlaying()
 		}
 		vtui.FrameManager.Redraw()
@@ -303,23 +308,22 @@ func (s *playerSession) StopIfPlaying(paths []string) {
 	s.queuePos = max(-1, min(pos, len(kept)-1))
 }
 
-// playQueueRelative steps through the file panel's files. Files that have
-// gone since the list was taken (deleted from the panel meanwhile) are
-// skipped.
+// playQueueRelative steps through the file panel's files, past either end
+// with repeat all. Files that have gone since the list was taken (deleted
+// from the panel meanwhile) are skipped.
 func (s *playerSession) playQueueRelative(delta int) bool {
-	for i := s.queuePos + delta; i >= 0 && i < len(s.queue); i += delta {
-		if _, err := os.Stat(s.queue[i]); err != nil {
-			continue
+	files := s.queue
+	return walkOrder(len(files), s.queuePos, delta, repeatsAll(), func(i int) bool {
+		if _, err := os.Stat(files[i]); err != nil {
+			return false
 		}
-		if s.PlayFile(s.queue, i) {
-			return true
-		}
-	}
-	return false
+		return s.PlayFile(files, i)
+	})
 }
 
 // playRelative plays the track delta positions away from the one playback is
-// at (s.at) in play order. With none it starts from the ends.
+// at (s.at) in play order (playOrder: with shuffle on the mix), past either
+// end with repeat all. With none it starts from the ends.
 //
 // A track that is not there any more is passed over, and so is one that does
 // not load, which leaves its error on the title row. A playlist outlives the
@@ -330,27 +334,17 @@ func (s *playerSession) playRelative(delta int) bool {
 	if s.queue != nil {
 		return s.playQueueRelative(delta)
 	}
-	list := s.root.tracks(nil)
-	if len(list) == 0 {
-		return false
+	order := s.playOrder()
+	pos := indexOfItem(order, s.at)
+	if config.App.PlayerShuffle && repeatsAll() && delta > 0 && pos >= 0 && pos == len(order)-1 {
+		order, pos = s.nextRound(order), -1
 	}
-	idx := indexOfItem(list, s.at)
-	if idx < 0 {
-		if delta > 0 {
-			idx = -1
-		} else {
-			idx = len(list)
+	return walkOrder(len(order), pos, delta, repeatsAll(), func(i int) bool {
+		if _, err := os.Stat(order[i].Path); errors.Is(err, os.ErrNotExist) {
+			return false
 		}
-	}
-	for idx += delta; idx >= 0 && idx < len(list); idx += delta {
-		if _, err := os.Stat(list[idx].Path); errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if s.playItem(list[idx]) {
-			return true
-		}
-	}
-	return false
+		return s.playItem(order[i])
+	})
 }
 
 func indexOfItem(list []*playlistItem, it *playlistItem) int {

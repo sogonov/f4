@@ -108,9 +108,9 @@ var keyInventoryAudit = map[string]keyInventoryEntry{
 	},
 	"panel.playerKeyCommand": {
 		areas: []string{"Shell"},
-		chords: []string{"H", "I", "Z", "X", "C", "V", "B", "K", "J", "L", "M", "ShiftP", "ShiftN",
+		chords: []string{"H", "I", "R", "S", "Z", "X", "C", "V", "B", "K", "J", "L", "M", "ShiftP", "ShiftN",
 			"VK_BB", "VK_BD", "Add", "Subtract"},
-		rationale: "the player's WinAmp and YouTube letter keys, its volume, H, which shows its keys, and I, which closes it and leaves the music playing, wherever its cursor is (Panel.Player.*)",
+		rationale: "the player's WinAmp and YouTube letter keys, its volume, H, which shows its keys, I, which closes it and leaves the music playing, and R and S, repeat and shuffle, wherever its cursor is (Panel.Player.*)",
 	},
 	"panel.playerDigit": {
 		areas:     []string{"Shell"},

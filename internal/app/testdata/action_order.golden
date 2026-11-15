@@ -401,6 +401,8 @@ Panel.Player.TogglePause
 Panel.Player.RemoveItem
 Panel.Player.ToggleKeyHints
 Panel.Player.ToBackground
+Panel.Player.Repeat
+Panel.Player.Shuffle
 Panel.Player.NewFolder
 Panel.Player.MoveItemUp
 Panel.Player.MoveItemDown

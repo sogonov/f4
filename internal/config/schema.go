@@ -77,6 +77,38 @@ func ParsePlayerKeys(value string) string {
 	}
 }
 
+// What the audio player repeats, as written to settings.ini: nothing, so it
+// stops after the last track; the whole playlist; or the track that plays
+// (f4#2185). R in the player goes from one to the next.
+const (
+	PlayerRepeatOff = "off"
+	PlayerRepeatAll = "all"
+	PlayerRepeatOne = "one"
+)
+
+// ParsePlayerRepeat normalizes a settings.ini value. Anything unrecognized
+// repeats nothing, as the player always did.
+func ParsePlayerRepeat(value string) string {
+	switch v := strings.ToLower(strings.TrimSpace(value)); v {
+	case PlayerRepeatAll, PlayerRepeatOne:
+		return v
+	default:
+		return PlayerRepeatOff
+	}
+}
+
+// NextPlayerRepeat is the repeat R goes to from repeat: off, all, one, off.
+func NextPlayerRepeat(repeat string) string {
+	switch ParsePlayerRepeat(repeat) {
+	case PlayerRepeatOff:
+		return PlayerRepeatAll
+	case PlayerRepeatAll:
+		return PlayerRepeatOne
+	default:
+		return PlayerRepeatOff
+	}
+}
+
 // ---- from colorer_settings.go ----
 // Cross drawing modes. FarColorer calls the option "Show cross" and lets the
 // scheme pick the axes through its parameters; those are not reachable through

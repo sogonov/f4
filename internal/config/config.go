@@ -487,6 +487,8 @@ type F4Config struct {
 	PlayerSpectrum           bool   // the audio player draws the spectrum of what plays, on by default as it always was (f4#2185)
 	PlayerKeys               string // the player's letter keys: PlayerKeysBoth, PlayerKeysWinAmp or PlayerKeysYouTube (f4#2185)
 	PlayerKeyHints           bool   // the player shows its keys under its buttons and in its border; H flips it (f4#2185)
+	PlayerRepeat             string // what the player repeats: PlayerRepeatOff, PlayerRepeatAll or PlayerRepeatOne; R goes through them (f4#2185)
+	PlayerShuffle            bool   // the player plays the playlist in a random order; S flips it (f4#2185)
 	EscTogglePanels          bool   // ESC toggles panels visibility (Far ships this as a macro; on by default)
 	TerminalCtrlNWorkspace   bool   // reserve Ctrl+N in terminal views for cloning panels to a workspace
 	KeepTerminalCursor       bool
@@ -776,6 +778,8 @@ var App = F4Config{
 	PlayerSpectrum:           true,
 	PlayerKeys:               PlayerKeysBoth,
 	PlayerKeyHints:           false,
+	PlayerRepeat:             PlayerRepeatOff,
+	PlayerShuffle:            false,
 	EscTogglePanels:          true,
 	TerminalCtrlNWorkspace:   true,
 	KeepTerminalCursor:       false,
@@ -1072,6 +1076,8 @@ func parseConfigInto(cfg *F4Config, merged *ini.File) {
 	cfg.PlayerSpectrum = merged.GetString("Panel", "PlayerSpectrum", "1") != "0"
 	cfg.PlayerKeys = ParsePlayerKeys(merged.GetString("Panel", "PlayerKeys", PlayerKeysBoth))
 	cfg.PlayerKeyHints = merged.GetString("Panel", "PlayerKeyHints", "0") == "1"
+	cfg.PlayerRepeat = ParsePlayerRepeat(merged.GetString("Panel", "PlayerRepeat", PlayerRepeatOff))
+	cfg.PlayerShuffle = merged.GetString("Panel", "PlayerShuffle", "0") == "1"
 	cfg.EscTogglePanels = merged.GetString("Panel", "EscTogglePanels", "1") == "1"
 	cfg.TerminalCtrlNWorkspace = merged.GetString("Panel", "TerminalCtrlNWorkspace", "1") == "1"
 	cfg.KeepTerminalCursor = merged.GetString("Panel", "KeepTerminalCursor", "0") == "1"
@@ -1451,6 +1457,8 @@ func SerializeSettingsConfig(cfg F4Config) []byte {
 	fmt.Fprintf(&sb, "PlayerSpectrum = %d\n", map[bool]int{true: 1, false: 0}[cfg.PlayerSpectrum])
 	fmt.Fprintf(&sb, "PlayerKeys = %s\n", ParsePlayerKeys(cfg.PlayerKeys))
 	fmt.Fprintf(&sb, "PlayerKeyHints = %d\n", map[bool]int{true: 1, false: 0}[cfg.PlayerKeyHints])
+	fmt.Fprintf(&sb, "PlayerRepeat = %s\n", ParsePlayerRepeat(cfg.PlayerRepeat))
+	fmt.Fprintf(&sb, "PlayerShuffle = %d\n", map[bool]int{true: 1, false: 0}[cfg.PlayerShuffle])
 	fmt.Fprintf(&sb, "EscTogglePanels = %d\n", map[bool]int{true: 1, false: 0}[cfg.EscTogglePanels])
 	fmt.Fprintf(&sb, "TerminalCtrlNWorkspace = %d\n", map[bool]int{true: 1, false: 0}[cfg.TerminalCtrlNWorkspace])
 	fmt.Fprintf(&sb, "KeepTerminalCursor = %d\n", map[bool]int{true: 1, false: 0}[cfg.KeepTerminalCursor])

@@ -41,6 +41,11 @@ func newPlayerFixture(t *testing.T, files ...string) *playerFixture {
 	t.Cleanup(func() { config.UserConfigDir = oldUserConfigDir })
 	config.ResetConfigDirForTest()
 	t.Cleanup(config.ResetConfigDirForTest)
+	// R and S change these and keep them in the settings; a test starts with
+	// the defaults and leaves them as it found them.
+	oldRepeat, oldShuffle := config.App.PlayerRepeat, config.App.PlayerShuffle
+	t.Cleanup(func() { config.App.PlayerRepeat, config.App.PlayerShuffle = oldRepeat, oldShuffle })
+	config.App.PlayerRepeat, config.App.PlayerShuffle = config.PlayerRepeatOff, false
 	engines := paneltest.UseFakeAudio(t)
 
 	f := &playerFixture{t: t, scr: initFrameworkActionTestScreen(t), dir: t.TempDir()}

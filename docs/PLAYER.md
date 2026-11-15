@@ -153,6 +153,8 @@ button again (#2185).
 | anywhere         | + / −          | volume                                |
 | anywhere         | H              | show the keys on the player, or hide them |
 | anywhere         | I              | close the player, the music plays on in the background |
+| anywhere         | R              | repeat: off → the playlist → the track → off (§1.5) |
+| anywhere         | S              | shuffle on / off (§1.5)               |
 | file panel       | Ctrl+Alt+Left/Right | seek 5 s without leaving the file panel |
 
 The keys are hidden by default, so the player is not a page of letters: its
@@ -244,6 +246,37 @@ cursor starts on the track that plays. The `Music.*` actions (play or
 pause, next, previous, stop; area Common, no default keys) work while a
 track is loaded and no player has the focus (condition `MusicPlaying`).
 
+### 1.5 Repeat and shuffle
+
+`internal/panel/player_order.go`, asked for in #2185. Two settings, kept in
+settings.ini under `[Panel]`: `PlayerRepeat` (`off`, the default, `all`,
+`one`; R goes through them, `Panel.Player.Repeat`) and `PlayerShuffle`
+(S, `Panel.Player.Shuffle`). R and S are the keys of WinAmp and of YouTube
+Music alike, so they work with either scheme. They show as `[R]` and `[S]`
+at the right end of the row of the stream facts, or of the clock with the
+bar off, lit (`ColPanelSelectedText`) while on, and `[R1]` while one track
+repeats; a click on them does what the key does. That row has room for them
+in an 80-column terminal; the row of the buttons has none, it would take the
+volume slider.
+
+- **Repeat one** plays the track that ended again (`playOnAfterEnd`); Next
+  and Previous still go to another track.
+- **Repeat all** goes on past either end (`walkOrder` with wrap): by the end
+  of the last track, by Next on it and by Previous on the first, in the
+  playlist and in the file panel's recordings alike.
+- **Shuffle** plays the playlist in `playerSession.shuffled`, a random order
+  that starts with the track that plays. It is kept while the playlist
+  changes (`keepShuffled`): what leaves the playlist leaves the order, and a
+  track added goes to a random place among those still to play. So every
+  track plays once in a round, and Previous goes back through what played.
+  With repeat all the round after the last track is a new order whose first
+  track is not the one that ended the round (`nextRound`). The file panel's
+  recordings play in the order of the panel.
+
+Tracks that are not there or do not load are passed over in every mode;
+with repeat all and nothing that loads, a walk tries every track once and
+stops.
+
 ## 2. Loose ends in the first patch
 
 Known and deliberate; each is small:
@@ -274,8 +307,9 @@ In rough order of value per hour:
    the VFS reader — `go-mp3` only needs `io.Reader` (no seek, no duration
    then). Both are reasonable; start with temp-file for correctness.
 4. **Mouse, KeyBar, palette, translations** (§2).
-5. **Repeat / shuffle** flags on the control row; a `[R]`/`[S]` pair after
-   the volume bar.
+5. ~~**Repeat / shuffle**~~ — done (§1.5), on the row of the stream facts
+   rather than after the volume bar, which has no room for them in an
+   80-column terminal.
 6. **More formats.** Wave and FLAC are pure Go (`gopxl/beep/v2/wav`,
    `mewkiz/flac`), Ogg Vorbis via `jfreymuth/oggvorbis`. The engine only
    needs a `decoder` interface `{ io.Reader; SampleRate() int; Length() int64 }`.

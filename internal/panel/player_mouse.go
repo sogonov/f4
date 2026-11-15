@@ -13,7 +13,8 @@ import (
 // playlist row puts the cursor there, a click on ▸ or ▾ folds or unfolds the
 // folder, and a double click plays the track or folds the folder. The wheel
 // scrolls the playlist, and over the slider turns the volume. A click on [-]
-// in the top right corner closes the player and leaves the music playing.
+// in the top right corner closes the player and leaves the music playing, and
+// one on [R] or [S] changes the repeat or the shuffle, as R and S do.
 
 // playerLayout is where Show put what the mouse can hit.
 type playerLayout struct {
@@ -23,6 +24,9 @@ type playerLayout struct {
 	buttonsY   int                     // the row of the buttons
 	buttons    [playerBtnVolume][2]int // the first and the last cell of each button
 	volX, volW int                     // the cells of the volume slider; volW is 0 with none
+	modesY     int                     // the row of repeat and shuffle: the facts', or the clock's with the bar off
+	repeatX    [2]int                  // the first and the last cell of [R]; zero with none drawn
+	shuffleX   [2]int                  // the same of [S]
 	listY      int                     // the first row of the playlist
 	listRows   int                     // how many rows of it there are
 }
@@ -85,7 +89,13 @@ func (pf *PanelsFrame) playerHideClick(e *vtinput.InputEvent, mx, my int) bool {
 
 func (pp *PlayerPanel) mousePress(mx, my int, double bool) {
 	l := &pp.layout
+	hit := func(span [2]int) bool { return span[1] > 0 && my == l.modesY && mx >= span[0] && mx <= span[1] }
 	switch {
+	// Before the bar: with the bar off they are on its row, the clock's.
+	case hit(l.repeatX):
+		pp.Do(PlayerCycleRepeat)
+	case hit(l.shuffleX):
+		pp.Do(PlayerToggleShuffle)
 	case my == l.barY:
 		pp.cursor = playerCursorBar
 		if l.barW > 0 && mx >= l.barX && mx < l.barX+l.barW && pp.Engine.IsLoaded() {

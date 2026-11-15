@@ -1053,6 +1053,24 @@ why on the top row of the player, and Next goes on from it. Play (X, K, the
 [ > ] button) after Stop starts the stopped track again; Enter on a track
 plays that track.
 
+  #R#                       Repeat: nothing, the whole playlist, the track
+                          that plays, and nothing again. [R] at the right
+                          end of the row of the stream facts is lit while
+                          the playlist repeats, [R1] while the track does.
+                          The whole playlist: Next on the last track and
+                          the end of it go to the first one, Previous on
+                          the first to the last. The track: its end plays
+                          it again; Next and Previous still go to another.
+
+  #S#                       Shuffle: the playlist in a random order, every
+                          track once in a round, starting with the one that
+                          plays; Previous goes back through that order. [S]
+                          is lit while it is on. With the whole playlist
+                          repeated every round has an order of its own.
+
+  A click on [R] or [S] does the same. Both are kept in the settings. The
+recordings of a file panel repeat too, but play in the order of the panel.
+
  #Keys in the player#
 
   The cursor walks one column: the playback bar, the buttons, the playlist.
@@ -1109,6 +1127,9 @@ WinAmp's, YouTube's or both, the default. They work in any keyboard layout.
                           track: 0 the start, 5 the middle.
 
   #+, -#                    Volume, with either.
+
+  #R, S#                    Repeat and shuffle, with either: see Playing
+                          the playlist above.
 
  #From the file panel#
 

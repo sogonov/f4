@@ -445,6 +445,8 @@ const (
 	PlayerSeekForward10
 	PlayerToggleKeyHints
 	PlayerToBackground
+	PlayerCycleRepeat
+	PlayerToggleShuffle
 )
 
 // Do does cmd and reports whether it was one the player knows.
@@ -483,6 +485,10 @@ func (pp *PlayerPanel) Do(cmd PlayerCommand) bool {
 		if pf := FindPanelsFrameAnyScreen(); pf != nil {
 			pf.closePlayer(pp)
 		}
+	case PlayerCycleRepeat:
+		pp.cycleRepeat()
+	case PlayerToggleShuffle:
+		pp.toggleShuffle()
 	default:
 		return false
 	}
@@ -572,7 +578,8 @@ func (pp *PlayerPanel) globalKey(e *vtinput.InputEvent) bool {
 // ten seconds back and forward, M mute, Shift+P and Shift+N the previous and
 // the next track. The two share no key, so both can be on. H, with either,
 // shows the keys on the player and hides them again, and I, YouTube's key of
-// its miniplayer, closes the player and leaves the music playing.
+// its miniplayer, closes the player and leaves the music playing. R and S
+// are repeat and shuffle in WinAmp and in YouTube Music alike.
 func playerKeyCommand(e *vtinput.InputEvent, scheme string) (PlayerCommand, bool) {
 	winamp := scheme != config.PlayerKeysYouTube
 	youtube := scheme != config.PlayerKeysWinAmp
@@ -582,6 +589,10 @@ func playerKeyCommand(e *vtinput.InputEvent, scheme string) (PlayerCommand, bool
 		return PlayerToggleKeyHints, true
 	case letter == vtinput.VK_I:
 		return PlayerToBackground, true
+	case letter == vtinput.VK_R:
+		return PlayerCycleRepeat, true
+	case letter == vtinput.VK_S:
+		return PlayerToggleShuffle, true
 	case winamp && letter == vtinput.VK_Z:
 		return PlayerPrevious, true
 	case winamp && letter == vtinput.VK_X:
@@ -959,6 +970,14 @@ func (pp *PlayerPanel) Show(scr *vtui.ScreenBuf) {
 	}
 	row := y + 1
 	pp.layout = playerLayout{barY: row}
+	// Repeat and shuffle at the right end of the row of the stream facts,
+	// which is the row of the clock with the bar off; the facts give way.
+	repeatMode, shuffleMode := playerModeLabels()
+	modesW, factsRoom := 0, w
+	if w >= playerModesMinWidth {
+		modesW = runewidth.StringWidth(repeatMode) + 1 + runewidth.StringWidth(shuffleMode)
+		factsRoom = w - modesW - 1
+	}
 	// The button in the top right corner that closes the player and leaves
 	// the music playing, while there is music to leave. It is right by the
 	// corner, as the ♪ that marks the music then is (DrawPlayerIndicator):
@@ -981,7 +1000,8 @@ func (pp *PlayerPanel) Show(scr *vtui.ScreenBuf) {
 				pp.layout.barX, pp.layout.barW = x+start, width
 			}
 		}
-		put(row+1, facts, text)
+		put(row+1, runewidth.Truncate(facts, factsRoom, "…"), text)
+		pp.layout.modesY = row + 1
 		row += 2
 	} else {
 		// The clock and the stream facts on one row.
@@ -990,11 +1010,15 @@ func (pp *PlayerPanel) Show(scr *vtui.ScreenBuf) {
 			clock = fmtClock(pp.Engine.Position()) + " / " + fmtClock(pp.Engine.Duration())
 		}
 		line := clock
-		if gap := w - runewidth.StringWidth(clock) - runewidth.StringWidth(facts); gap > 1 {
+		if gap := factsRoom - runewidth.StringWidth(clock) - runewidth.StringWidth(facts); gap > 1 {
 			line += strings.Repeat(" ", gap) + facts
 		}
 		put(row, line, barAttr)
+		pp.layout.modesY = row
 		row++
+	}
+	if modesW > 0 {
+		pp.showModes(scr, x+w-modesW, pp.layout.modesY, repeatMode, shuffleMode, text, hi)
 	}
 
 	// The spectrum, when it is on: two rows of eighth blocks, 16 levels a band.
@@ -1118,6 +1142,37 @@ func playbackClocks(pos, dur time.Duration, loaded bool) (left, right string) {
 func playbackBarSpan(left, right string, w int) (start, width int) {
 	lw := runewidth.StringWidth(left)
 	return lw + 1, w - lw - runewidth.StringWidth(right) - 2
+}
+
+// playerModesMinWidth is the narrowest player that shows repeat and shuffle;
+// R and S work in a narrower one all the same.
+const playerModesMinWidth = 20
+
+// playerModeLabels are repeat and shuffle as the player shows them: [R] and
+// [S], lit while on, and [R1] while it repeats the track that plays. ASCII,
+// as the buttons are: the arrows of ↻ and ⤮ are in few fonts (#2185).
+func playerModeLabels() (repeat, shuffle string) {
+	repeat = "[R]"
+	if config.App.PlayerRepeat == config.PlayerRepeatOne {
+		repeat = "[R1]"
+	}
+	return repeat, "[S]"
+}
+
+// showModes writes repeat and shuffle from x on row y, each in attribute on
+// while it is on and off while not, and keeps where they are for the mouse.
+func (pp *PlayerPanel) showModes(scr *vtui.ScreenBuf, x, y int, repeat, shuffle string, off, on uint64) {
+	attr := func(lit bool) uint64 {
+		if lit {
+			return on
+		}
+		return off
+	}
+	rw := runewidth.StringWidth(repeat)
+	scr.Write(x, y, vtui.StringToCharInfo(repeat, attr(config.App.PlayerRepeat != config.PlayerRepeatOff)))
+	scr.Write(x+rw+1, y, vtui.StringToCharInfo(shuffle, attr(config.App.PlayerShuffle)))
+	pp.layout.repeatX = [2]int{x, x + rw - 1}
+	pp.layout.shuffleX = [2]int{x + rw + 1, x + rw + runewidth.StringWidth(shuffle)}
 }
 
 // showKeyHints writes on the bottom border how to see the player's keys, or,

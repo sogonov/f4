@@ -96,6 +96,10 @@ var configOptionExtraDocs = map[string]string{
 		"folder: into the folder under the pointer; ask: ask which of the two. Where f4 can follow the drag (Windows, X11), the highlighted folder is where the files go.",
 	"Panel.PlayerKeyHints": "1 while the audio player (Ctrl+Shift+M) shows its keys under its buttons and in its bottom border. " +
 		"H in the player turns it on and off; 0, the default, shows only how to see them.",
+	"Panel.PlayerRepeat": "What the audio player (Ctrl+Shift+M) repeats: off, the default, stops after the last track of the playlist; " +
+		"all starts the playlist again; one plays the same track again. R in the player goes from one to the next.",
+	"Panel.PlayerShuffle": "1 while the audio player (Ctrl+Shift+M) plays its playlist in a random order, each track once before any comes again; " +
+		"0, the default, plays it from the top down. S in the player turns it on and off.",
 	"Panel.VimHotkeys": "Kept for older f4 versions and shared settings files: 1 while NavigationMode is vim. " +
 		"f4 reads it only when NavigationMode is missing.",
 	"System.AutoSaveSettings": "The older switch for automatic saving. f4 keeps it on while any of the four automatic saving options is on, " +
