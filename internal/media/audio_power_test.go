@@ -233,8 +233,12 @@ func TestAudioEngineHoldsTheOutputOnlyWhilePlaying(t *testing.T) {
 // (#2185). oto corked the stream on Suspend, and on Resume the Started event
 // of the server parked the library's reader for good; oto v3.5.0 suspends by
 // holding the read callback alone. The test needs a device that plays in
-// real time, and is skipped elsewhere; the Windows arm64 runner of CI has a
-// device on which the track moved 46ms in a second after the resume.
+// real time, and is skipped elsewhere.
+//
+// The track has to move again, not at once: on the Windows arm64 runner of
+// CI, with the old oto and the new alike, WASAPI took half a second to more
+// than one before it played again after a resume. The old oto on a Linux
+// runner with PulseAudio's null sink: never.
 func TestAudioEngineGoesOnPlayingAfterTheOutputWasSuspended(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "silence.wav")
 	if err := os.WriteFile(path, wavBytes(1, 2, 44100, 16, make([]byte, 5*44100*AudioBytesPerFrame)), 0o600); err != nil {
@@ -278,7 +282,10 @@ func TestAudioEngineGoesOnPlayingAfterTheOutputWasSuspended(t *testing.T) {
 	}
 
 	a.Play()
-	if moved := playsFor(time.Second); moved < 500*time.Millisecond {
-		t.Fatalf("after the output was suspended and resumed the track moved %s in 1s of playing, %s in 500ms before; want it to play on", moved, before)
+	from := a.Position()
+	for deadline := time.Now().Add(3 * time.Second); a.Position()-from < 200*time.Millisecond; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("after the output was suspended and resumed the track moved %s in 3s of playing, %s in 500ms before; want it to play on", a.Position()-from, before)
+		}
 	}
 }
